@@ -16,31 +16,36 @@ import {
 import { Input } from "@/components/ui/input";
 import { Alert, AlertTitle } from "@/components/ui/alert";
 import { OctagonAlertIcon } from "lucide-react";
+import { FaGoogle, FaGithub } from "react-icons/fa";
 import { Button } from "@/components/ui/button";
 import Link from "next/link";
 import { authClient } from "@/lib/auth-client";
-import { useRouter } from "next/navigation";
 import { useState } from "react";
-import { da } from "date-fns/locale";
+import { useRouter } from "next/navigation";
 
-const formSchema = z.object({
+const formSchema = z
+  .object({
     name: z.string().min(1, { message: "Name is required" }),
-  email: z.string().email({ message: "Invalid email address" }),
-  password: z.string().min(8, { message: "Password is required" }),
-  confirmPassword: z.string().min(8, { message: "Confirm Password is required" }),
-}).refine((data) => data.password === data.confirmPassword, {
-  message: "Passwords do not match",
+    email: z.string().email({ message: "Invalid email address" }),
+    password: z.string().min(8, { message: "Password is required" }),
+    confirmPassword: z
+      .string()
+      .min(8, { message: "Confirm Password is required" }),
+  })
+  .refine((data) => data.password === data.confirmPassword, {
+    message: "Passwords do not match",
     path: ["confirmPassword"],
-});
+  });
 
 export const SignUpView = () => {
+
   const router = useRouter();
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const form = useForm<z.infer<typeof formSchema>>({
     resolver: zodResolver(formSchema),
     defaultValues: {
-        name: "",
+      name: "",
       email: "",
       password: "",
       confirmPassword: "",
@@ -56,6 +61,7 @@ export const SignUpView = () => {
         name: data.name,
         email: data.email,
         password: data.password,
+        callbackURL: "/",
       },
       {
         onSuccess: () => {
@@ -173,11 +179,31 @@ export const SignUpView = () => {
                   </span>
                 </div>
                 <div className="grid grid-cols-2 gap-4">
-                  <Button disabled={loading} variant="outline" type="button" className="w-full">
-                    Google
+                  <Button
+                    disabled={loading}
+                    onClick={() => {
+                      authClient.signIn.social({
+                        provider: "google",
+                      });
+                    }}
+                    variant="outline"
+                    type="button"
+                    className="w-full"
+                  >
+                    <FaGoogle />
                   </Button>
-                  <Button disabled={loading} variant="outline" type="button" className="w-full">
-                    Github
+                  <Button
+                    disabled={loading}
+                    onClick={() => {
+                      authClient.signIn.social({
+                        provider: "github",
+                      });
+                    }}
+                    variant="outline"
+                    type="button"
+                    className="w-full"
+                  >
+                    <FaGithub />
                   </Button>
                 </div>
                 <div className="text-center text-sm">
