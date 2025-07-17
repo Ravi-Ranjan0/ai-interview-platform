@@ -3,11 +3,10 @@
 import { Separator } from "@/components/ui/separator";
 import { Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupContent, SidebarHeader, SidebarMenu, SidebarMenuButton, SidebarMenuItem } from "@/components/ui/sidebar";
 import { cn } from "@/lib/utils";
-import { BotIcon, icons, StarIcon, VideoIcon } from "lucide-react"
+import { BotIcon, StarIcon, VideoIcon } from "lucide-react"
 import Image from "next/image";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import path from "path";
 import DashboardUserButton from "./dashboard-user-button";
 
 const firstSection = [
@@ -44,7 +43,7 @@ export const DashboardSidebar = () => {
                 <Link href="/" className="flex items-center gap-2 px-2 pt-2">
                 {/* I can change the link of the logo here */}
                 {/* <Image href="/logo.png" alt="Logo" width={32} height={32} className="rounded-full" alt = "ai"/> */}
-                <p className="text-2xl font-semibold">Ai</p>
+                <p className="text-2xl font-semibold truncate">Ai - Interview</p>
                 </Link>
             </SidebarHeader>
             <div className="px-4 py-2">
