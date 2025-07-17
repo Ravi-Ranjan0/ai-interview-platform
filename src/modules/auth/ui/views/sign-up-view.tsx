@@ -219,7 +219,7 @@ export const SignUpView = () => {
             </form>
           </Form>
 
-          <div className="bg-radial from-blue-500 to-blue-800 relative hidden md:flex flex-col gap-y-4 items-center justify-center">
+          <div className="bg-radial from-sidebar-accent to-sidebar relative hidden md:flex flex-col gap-y-4 items-center justify-center">
             {/* // If we wanted to add logo we could uncomment this line */}
             {/* <Image className="rounded-full" src="/logo.png" alt="Logo" width={92} height={92} /> */}
             <p className="text-2xl font-semibold text-white">AI-Interview</p>

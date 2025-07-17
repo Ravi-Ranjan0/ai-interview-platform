@@ -72,14 +72,17 @@
   --chart-5: oklch(0.769 0.188 70.08);
   /* Sidebar color is changed here  */
   /* --sidebar: oklch(0.985 0 0); */
-  --sidebar: oklch(63.062% 0.12107 237.169);
-  --sidebar-foreground: oklch(0.145 0 0);
-  --sidebar-primary: oklch(0.205 0 0);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.97 0 0);
-  --sidebar-accent-foreground: oklch(0.205 0 0);
-  --sidebar-border: oklch(0.922 0 0);
-  --sidebar-ring: oklch(0.708 0 0);
+  --sidebar: oklch(0.3 0.06 250);
+  /* Sidebar text color  */
+  --sidebar-foreground: oklch(0.85 0.01 255);
+  --sidebar-primary: oklch(0.35 0.02 250);
+  --sidebar-primary-foreground: oklch(0.97 0.005 255);
+  /* sidebar active item background color */
+  --sidebar-accent: oklch(0.45 0.08 250);
+  /* sidebar active item text color */
+  --sidebar-accent-foreground: oklch(1 0 0);
+  --sidebar-border: oklch(0.8 0.01 255);
+  --sidebar-ring: oklch(0.65 0.015 255);
 }
 
 .dark {

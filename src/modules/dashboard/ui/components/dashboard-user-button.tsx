@@ -12,7 +12,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { authClient } from "@/lib/auth-client";
-import { ChevronDown, ChevronDownIcon, CreditCardIcon, LogOutIcon } from "lucide-react";
+import { ChevronDownIcon, CreditCardIcon, LogOutIcon } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import React from "react";
@@ -123,7 +123,7 @@ const DashboardUserButton = () => {
         </DropdownMenuLabel>
         <DropdownMenuSeparator />
         <DropdownMenuItem className="cursor-pointer flex items-center justify-between">
-            <Link href="/billing" className="w-full">
+            <Link href="/billing" className="w-full flex items-center justify-between">
                 Billing
                 <CreditCardIcon className="size-4"/>
             </Link>
