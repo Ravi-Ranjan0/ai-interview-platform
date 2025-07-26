@@ -4,6 +4,7 @@ import { ChevronsUpDownIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { CommandEmpty, CommandInput, CommandItem, CommandList, CommandResponsiveDialog } from "./ui/command";
 import { on } from "events";
+import { se } from "date-fns/locale";
 
 
 interface Props{
@@ -31,7 +32,10 @@ export const CommandSelect = ({
 }: Props) => {
     const [open, setOpen] = useState(false);
     const selectedOption = options.find(option => option.value === value);
-
+    const handleOpenChange = (open: boolean) => {
+        onSearch?.("");
+        setOpen(open);
+    };
 
     return (
         <>
@@ -51,7 +55,7 @@ export const CommandSelect = ({
         <CommandResponsiveDialog
             shouldFilter={!onSearch}
             open={open}
-            onOpenChange={setOpen}
+            onOpenChange={handleOpenChange}
         >
             <CommandInput placeholder="Search an option..." onValueChange={onSearch} />
             <CommandList>
