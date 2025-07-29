@@ -1,7 +1,7 @@
 import { db } from "@/db";
 import { agents, meetings } from "@/db/schema";
 import { createTRPCRouter, protectedProcedure } from "@/trpc/init";
-import z, { record } from "zod";
+import z from "zod";
 import { eq, getTableColumns, count, sql, and, ilike, desc } from "drizzle-orm";
 import { DEFAULT_PAGE, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MIN_PAGE_SIZE } from "@/constant";
 import { TRPCError } from "@trpc/server";
@@ -9,7 +9,6 @@ import { meetingsInsertSchema, meetingsUpdateSchema } from "../schema";
 import { MeetingStatus } from "../type";
 import { streamVideo } from "@/lib/stream-video";
 import { generateAvatarUri } from "@/lib/avatar";
-import { languages } from "humanize-duration";
 
 
 export const meetingsRouter = createTRPCRouter({

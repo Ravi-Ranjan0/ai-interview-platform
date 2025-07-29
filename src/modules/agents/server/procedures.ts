@@ -6,6 +6,7 @@ import z from "zod";
 import { eq, getTableColumns, count, sql, and, ilike, desc } from "drizzle-orm";
 import { DEFAULT_PAGE, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MIN_PAGE_SIZE } from "@/constant";
 import { TRPCError } from "@trpc/server";
+import { inngest } from "@/inngest/client";
 
 
 export const agentsRouter = createTRPCRouter({
@@ -62,6 +63,7 @@ export const agentsRouter = createTRPCRouter({
             const [existingAgent] = await db
                 .select({
                     meetingCount: sql<number>`5`,
+                    last_Response: agents.lastResponse,
                     ...getTableColumns(agents),
                 })
                 .from(agents)
@@ -143,6 +145,13 @@ export const agentsRouter = createTRPCRouter({
                     userId: ctx.auth.user.id, // Assuming user.id is available in the context
                 })
                 .returning();
+
+                await inngest.send({
+                    name:"agents/questions",
+                    data: {
+                        agentId: createdAgent.id
+                    },
+                })
 
             return createdAgent;
         }),
