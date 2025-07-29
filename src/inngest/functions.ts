@@ -114,3 +114,80 @@ export const meetingsProcessing = inngest.createFunction(
       });
 
   });
+
+
+const questionGenerator = createAgent({
+  name: "question-generator",
+  system: `
+  Act like a professional prompt-based question generator. You specialize in crafting thoughtful, relevant, and well-structured questions in response to user-provided instructions across any domain. Your only responsibility is to produce a clean list of questions that probe deeply into the subject matter the user has specified.
+
+You must:
+- Generate only questions—do not include categories, titles, summaries, or explanations.
+- Ensure each question is precise, context-aware, and aligned with the user’s intent.
+- Write in a clear and professional tone, avoiding repetition, ambiguity, or overly simplistic phrasing.
+- Encourage reflection, critical thinking, or detailed responses, depending on the topic.
+- Cover different angles and cognitive levels (e.g. factual, analytical, evaluative, situational, or hypothetical).
+- Format your output strictly as a list of bullet-pointed questions without numbering, headings, or meta commentary.
+- Adapt to any type of instruction, whether it relates to science, education, psychology, business, strategy, design, writing, ethics, or others.
+
+Do not answer the questions. Do not explain your choices. Do not group or organize by theme. Simply generate a flat list of refined, standalone questions based solely on the user's instructions.
+
+Take a deep breath and work on this problem step-by-step.
+
+  `,
+  model: gemini({
+    model: "gemini-1.5-flash-8b",
+    apiKey: process.env.GEMINI_API_KEY,
+  }),
+});
+
+export const generateAgentQuestions = inngest.createFunction(
+  { id: "generate-agent-questions" },
+  { event: "agents/questions" }, // ✅ Event name expects only agentId
+  async ({ event, step }) => {
+    const { agentId } = event.data;
+    console.log("🚀 Inngest function fired with agentId:", agentId);
+
+    // Step 1: Fetch agent by ID
+    const agent = await step.run("fetch-agent", async () => {
+      return db
+        .select()
+        .from(agents)
+        .where(eq(agents.id, agentId))
+        .then(res => res[0]);
+    });
+
+    if (!agent) {
+      throw new Error("Agent not found");
+    }
+
+    // Step 2: Generate questions using instructions
+    const { output } = await questionGenerator.run(
+      `Based on the following user instructions, generate a list of thoughtful questions:\n\n${agent.instructions}`
+    );
+    console.log("Generated questions:", output);
+
+    // const generatedQuestions = (output[0] as TextMessage).content;
+
+    const rawOutput = output[0] as TextMessage;
+
+const generatedQuestions =
+  typeof rawOutput.content === "string"
+    ? rawOutput.content
+    : rawOutput.content.map(c => c.text).join("\n"); // For TextContent[]
+
+
+    // Step 3: Save questions to agent's lastResponse
+    await step.run("save-response", async () => {
+      await db
+        .update(agents)
+        .set({
+          lastResponse: generatedQuestions,
+          updatedAt: new Date(),
+        })
+        .where(eq(agents.id, agentId));
+    });
+
+    return { questions: generatedQuestions };
+  }
+);

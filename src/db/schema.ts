@@ -1,5 +1,3 @@
-import { id } from "date-fns/locale";
-import { sum } from "drizzle-orm";
 import { pgTable, text, timestamp, boolean, integer, pgEnum } from "drizzle-orm/pg-core";
 import { nanoid } from "nanoid";
 
@@ -55,6 +53,7 @@ export const agents = pgTable("agents", {
   name: text('name').notNull(),
   userId: text('user_id').notNull().references(() => user.id, { onDelete: 'cascade' }),
   instructions: text('instructions').notNull(),
+  lastResponse: text('last_response'),
   createdAt: timestamp('created_at').notNull().defaultNow(),
   updatedAt: timestamp('updated_at').notNull().defaultNow(),
 });
