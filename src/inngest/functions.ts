@@ -4,12 +4,12 @@ import JSONL from "jsonl-parse-stringify";
 import { db } from "@/db";
 import { agents, meetings, user } from "@/db/schema";
 import { eq, inArray } from "drizzle-orm";
-import {createAgent, openai,gemini, TextMessage} from "@inngest/agent-kit";
+import { createAgent, openai, gemini, TextMessage } from "@inngest/agent-kit";
 
 
 const summarizer = createAgent({
   name: "summarizer",
-  system:`You are an expert summarizer. You write readable, concise, simple content. You are given a transcript of a meeting and you need to summarize it.
+  system: `You are an expert summarizer. You write readable, concise, simple content. You are given a transcript of a meeting and you need to summarize it.
 
 Use the following markdown structure for every output:
 
@@ -28,11 +28,11 @@ Example:
 #### Next Section
 - Feature X automatically does Y
 - Mention of integration with Z`
-.trim(),
+    .trim(),
   model: gemini({
-            model: "gemini-1.5-flash-8b",
-            apiKey: process.env.GEMINI_API_KEY
-        }),
+    model: "gemini-1.5-flash-8b",
+    apiKey: process.env.GEMINI_API_KEY
+  }),
 })
 
 
@@ -98,7 +98,7 @@ export const meetingsProcessing = inngest.createFunction(
     });
 
 
-    const {output} = await summarizer.run(
+    const { output } = await summarizer.run(
       "Summarize the following transcript:" +
       JSON.stringify(transcriptWithSpeakers)
     )
@@ -111,7 +111,7 @@ export const meetingsProcessing = inngest.createFunction(
           status: "completed",
         })
         .where(eq(meetings.id, event.data.meetingId));
-      });
+    });
 
   });
 
@@ -171,10 +171,10 @@ export const generateAgentQuestions = inngest.createFunction(
 
     const rawOutput = output[0] as TextMessage;
 
-const generatedQuestions =
-  typeof rawOutput.content === "string"
-    ? rawOutput.content
-    : rawOutput.content.map(c => c.text).join("\n"); // For TextContent[]
+    const generatedQuestions =
+      typeof rawOutput.content === "string"
+        ? rawOutput.content
+        : rawOutput.content.map(c => c.text).join("\n"); // For TextContent[]
 
 
     // Step 3: Save questions to agent's lastResponse
