@@ -4,7 +4,11 @@ import JSONL from "jsonl-parse-stringify";
 import { db } from "@/db";
 import { agents, meetings, user } from "@/db/schema";
 import { eq, inArray } from "drizzle-orm";
-import { createAgent, openai, gemini, TextMessage } from "@inngest/agent-kit";
+import { createAgent, openai, gemini, TextMessage, } from "@inngest/agent-kit";
+import { qdrant } from "@/lib/qdrant";
+import { GeminiAI } from "@/lib/gemini-client";
+import { geminiEmbeddings } from "@/lib/embedding";
+import { randomUUID } from "crypto";
 
 
 const summarizer = createAgent({
@@ -189,5 +193,356 @@ export const generateAgentQuestions = inngest.createFunction(
     });
 
     return { questions: generatedQuestions };
+  }
+);
+
+// export const generateAndStoreEmbeddings = inngest.createFunction(
+//   { id: "generate-and-store-embeddings" },
+//   { event: "agents/generate-embeddings" },
+//   async ({ event, step }) => {
+//     const { agentId, texts } = event.data;
+//     console.log("🔹 Generating embeddings for agent:", agentId);
+
+//     // 1️⃣ Fetch agent info
+//     const agent = await step.run("fetch-agent", async () => {
+//       const res = await db.select().from(agents).where(eq(agents.id, agentId));
+//       return res[0];
+//     });
+
+//     if (!agent) throw new Error("Agent not found");
+
+//     // 2️⃣ Generate embeddings using Gemini
+//     const embeddings = await step.run("generate-embeddings", async () => {
+//       const model = GeminiAI.getGenerativeModel({
+//         model: "text-embedding-004", // ✅ Gemini’s embedding model
+//       });
+
+//       interface EmbeddingResult {
+//         embedding: { values: number[] };
+//       }
+
+//       interface EmbeddingVector {
+//         id: string;
+//         vector: number[];
+//         payload: {
+//           agentId: string;
+//           text: string;
+//         };
+//       }
+
+//       const textsArray = texts as string[];
+//       const vectors: EmbeddingVector[] = await Promise.all(
+//         textsArray.map(async (text: string, idx: number) => {
+//           const result = (await model.embedContent(text)) as EmbeddingResult;
+//           return {
+//         id: `${agentId}-${idx}`,
+//         vector: result.embedding.values,
+//         payload: { agentId, text },
+//           };
+//         })
+//       );
+
+//       return vectors;
+//     });
+
+//     // 3️⃣ Store embeddings in Qdrant
+//     await step.run("store-embeddings", async () => {
+//       await qdrant.upsert("agents", {
+//         points: embeddings.map((e) => ({
+//           id: e.id,
+//           vector: e.vector,
+//           payload: e.payload,
+//         })),
+//       });
+//     });
+
+//     return { success: true };
+//   }
+// );
+
+const VECTOR_SIZE = 3072; // Must match your embedding model
+
+// Ensure collection exists
+// async function ensureCollection() {
+//   const collections = await qdrant.getCollections();
+//   const exists = collections.collections.some(c => c.name === "agents");
+
+//   if (!exists) {
+//     await qdrant.createCollection("agents", {
+//       vectors: { size: VECTOR_SIZE, distance: "Cosine" },
+//     });
+//     console.log("✅ Collection 'agents' created");
+//   }
+// }
+async function ensureCollection() {
+  const collections = await qdrant.getCollections();
+  const exists = collections.collections.some(c => c.name === "agents");
+
+  // If exists, ensure size matches — if not, recreate
+  if (exists) {
+    const info = await qdrant.getCollection("agents");
+
+    // qdrant response shapes may vary between SDK versions; try common locations for vector size.
+    const currentVectorSize =
+      (info as any).vectors?.size ??
+      (info as any).config?.vectors?.size ??
+      (info as any).config?.params?.vectors?.size ??
+      null;
+
+    if (currentVectorSize === null) {
+      console.warn(
+        `⚠️ Could not determine vector size for 'agents' collection, recreating to ensure correct vector size (${VECTOR_SIZE})`
+      );
+      await qdrant.deleteCollection("agents");
+    } else if (currentVectorSize !== VECTOR_SIZE) {
+      console.warn(
+        `⚠️ Recreating 'agents' collection with correct vector size (${VECTOR_SIZE}), found ${currentVectorSize}`
+      );
+      await qdrant.deleteCollection("agents");
+    } else {
+      return; // ✅ Already correct
+    }
+  }
+
+  await qdrant.createCollection("agents", {
+    vectors: { size: VECTOR_SIZE, distance: "Cosine" },
+  });
+
+  console.log(`✅ Collection 'agents' created with vector size ${VECTOR_SIZE}`);
+}
+
+
+// export const generateAndStoreEmbeddings = inngest.createFunction(
+//   { id: "generate-and-store-embeddings" },
+//   { event: "agents/generate-embeddings" },
+//   async ({ event, step }) => {
+//     const { agentId, texts } = event.data;
+//     console.log("🔹 Generating embeddings for agent:", agentId);
+
+//     await ensureCollection();
+
+//     // 1️⃣ Fetch agent info
+//     const agent = await step.run("fetch-agent", async () => {
+//       const res = await db.select().from(agents).where(eq(agents.id, agentId));
+//       return res[0];
+//     });
+
+//     if (!agent) throw new Error("Agent not found");
+
+//     // 2️⃣ Generate embeddings
+//     const embeddings = await step.run("generate-embeddings", async () => {
+//       const model = GeminiAI.getGenerativeModel({ model: "text-embedding-004" });
+
+//       const vectors = await Promise.all(
+//         (texts as string[]).map(async (text: string, idx: number) => {
+//           const result = await model.embedContent(text);
+//           const vector = result.embedding.values;
+
+//           if (vector.length !== VECTOR_SIZE) {
+//             throw new Error(`Invalid embedding length: ${vector.length}, expected ${VECTOR_SIZE}`);
+//           }
+
+//           return {
+//             id: `${agentId}-${idx}`,
+//             vector,
+//             payload: { agentId, text },
+//           };
+//         })
+//       );
+
+//       return vectors;
+//     });
+
+//     // 3️⃣ Store embeddings in Qdrant
+//     await step.run("store-embeddings", async () => {
+//       const points = embeddings.map(e => ({
+//         id: e.id,
+//         vector: e.vector,
+//         payload: e.payload || {},
+//       }));
+
+//       await qdrant.upsert("agents", { points });
+//       console.log(`✅ Stored ${points.length} embeddings for agent ${agentId}`);
+//     });
+
+//     return { success: true };
+//   }
+// );
+
+// export const generateAndStoreEmbeddings = inngest.createFunction(
+//   { id: "generate-and-store-embeddings" },
+//   { event: "agents/generate-embeddings" },
+//   async ({ event, step }) => {
+//     const { agentId, texts } = event.data;
+//     console.log("🔹 Generating embeddings for agent:", agentId);
+
+//     await ensureCollection();
+
+//     // 1️⃣ Fetch agent info
+//     const agent = await step.run("fetch-agent", async () => {
+//       const res = await db.select().from(agents).where(eq(agents.id, agentId));
+//       return res[0];
+//     });
+
+//     if (!agent) throw new Error("Agent not found");
+
+//     // 2️⃣ Generate embeddings using LangChain Gemini Embeddings
+//     const vectors = await step.run("generate-embeddings", async () => {
+//       const textArray = texts as string[];
+//       console.log(`Generating embeddings for ${textArray.length} texts`);
+//       console.log("Text Array sample:", textArray);
+
+//       const results = await Promise.all(
+//         textArray.map(async (text, idx) => {
+//           const vector = await geminiEmbeddings.embedQuery(text);
+//           console.log(`Generated embedding for text index ${idx}, length: ${vector.length}`, vector);
+
+//           return {
+//             id: `${agentId}-${idx}`,
+//             vector,
+//             payload: { agentId, text: text.substring(0, 1000), textIndex: idx }, // Truncate text to first 1000 chars
+//           };
+//         })
+//       );
+
+//       return results;
+//     });
+
+//     // 3️⃣ Store embeddings in Qdrant
+//     await step.run("store-embeddings", async () => {
+//       try {
+
+//         const points = vectors.map(e => ({
+//           id: e.id,
+//           vector: e.vector,
+//           payload: e.payload,
+//         }));
+//         console.log(`📦 Preparing to upsert ${points.length} points`);
+//         console.log(`📏 Sample vector dimension: ${points[0].vector.length}`);
+//         console.log("📝 Sample payload:", points[0].payload);
+//         console.log("🔢 Sample point:", points[0]);
+//         console.log("🚀 Upserting points to Qdrant...", points);
+
+
+
+//         await qdrant.upsert("agents", { points, wait: true });
+//         console.log(`✅ Stored ${points.length} embeddings for agent ${agentId}`);
+//       } catch (error) {
+//         console.error("❌ Error storing embeddings in Qdrant:", error);
+//       }
+//     });
+
+//     return { success: true, pointsStored: vectors.length, agentId };
+//   }
+// );
+
+export const generateAndStoreEmbeddings = inngest.createFunction(
+  { id: "generate-and-store-embeddings" },
+  { event: "agents/generate-embeddings" },
+  async ({ event, step }) => {
+    const { agentId, texts } = event.data;
+    console.log("🔹 Generating embeddings for agent:", agentId);
+
+    // Ensure collection exists with correct dimensions
+    await ensureCollection();
+
+    // 1️⃣ Fetch agent info
+    const agent = await step.run("fetch-agent", async () => {
+      const res = await db.select().from(agents).where(eq(agents.id, agentId));
+      return res[0];
+    });
+
+    if (!agent) throw new Error("Agent not found");
+
+    // 2️⃣ Generate embeddings using LangChain Gemini Embeddings
+    const vectors = await step.run("generate-embeddings", async () => {
+      const textArray = texts as string[];
+      console.log(`Generating embeddings for ${textArray.length} texts`);
+      console.log("Text Array sample:", textArray.slice(0, 2)); // Only log first 2 for brevity
+
+      const results = await Promise.all(
+        textArray.map(async (text, idx) => {
+          const vector = await geminiEmbeddings.embedQuery(text);
+          
+          // Validate vector dimension
+          if (vector.length !== VECTOR_SIZE) {
+            throw new Error(
+              `Vector dimension mismatch! Expected ${VECTOR_SIZE}, got ${vector.length}`
+            );
+          }
+          
+          console.log(`✅ Generated embedding ${idx + 1}/${textArray.length}, dimension: ${vector.length}`);
+
+          return {
+            // id: `${agentId}-${idx}`,
+            id: randomUUID(),
+            vector,
+            payload: { 
+              agentId, 
+              text: text.substring(0, 1000), // Truncate text to first 1000 chars
+              textIndex: idx 
+            },
+          };
+        })
+      );
+
+      console.log(`✅ Generated ${results.length} embeddings`);
+      return results;
+    });
+
+    // 3️⃣ Store embeddings in Qdrant
+    const result = await step.run("store-embeddings", async () => {
+      try {
+        // Verify collection configuration
+        const collectionInfo = await qdrant.getCollection("agents");
+        const collectionVectorSize = 
+          (collectionInfo as any).vectors?.size ??
+          (collectionInfo as any).config?.vectors?.size ??
+          (collectionInfo as any).config?.params?.vectors?.size;
+
+        console.log(`📊 Collection vector size: ${collectionVectorSize}`);
+        
+        if (collectionVectorSize !== VECTOR_SIZE) {
+          throw new Error(
+            `Collection dimension mismatch! Collection has ${collectionVectorSize}, embeddings have ${VECTOR_SIZE}`
+          );
+        }
+
+        const points = vectors.map(e => ({
+          id: e.id,
+          vector: e.vector,
+          payload: e.payload,
+        }));
+
+        console.log(`📦 Upserting ${points.length} points to Qdrant`);
+        console.log(`📏 First vector dimension: ${points[0].vector.length}`);
+        console.log(`📝 Sample payload:`, points[0].payload);
+
+        const upsertResult = await qdrant.upsert("agents", { 
+          points, 
+          wait: true 
+        });
+        
+        console.log(`✅ Successfully stored ${points.length} embeddings for agent ${agentId}`);
+        console.log(`📊 Upsert result:`, upsertResult);
+        
+        return { success: true, pointsStored: points.length };
+      } catch (error: any) {
+        console.error("❌ Error storing embeddings in Qdrant:");
+        console.error("❌ Error message:", error.message);
+        console.error("❌ Error status:", error.status);
+        console.error("❌ Error data:", JSON.stringify(error.data, null, 2));
+        console.error("❌ Full error:", error);
+        
+        // Re-throw to mark step as failed
+        throw new Error(`Failed to store embeddings: ${error.message}`);
+      }
+    });
+
+    return { 
+      success: true, 
+      pointsStored: result.pointsStored, 
+      agentId 
+    };
   }
 );

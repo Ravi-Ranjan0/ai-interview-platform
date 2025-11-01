@@ -53,6 +53,8 @@ export const agents = pgTable("agents", {
   name: text('name').notNull(),
   userId: text('user_id').notNull().references(() => user.id, { onDelete: 'cascade' }),
   instructions: text('instructions').notNull(),
+  urls: text('urls'),  // Comma-separated URLs
+  // pdfUrl: text('pdf_url'),
   lastResponse: text('last_response'),
   createdAt: timestamp('created_at').notNull().defaultNow(),
   updatedAt: timestamp('updated_at').notNull().defaultNow(),

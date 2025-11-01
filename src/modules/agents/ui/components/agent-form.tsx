@@ -31,14 +31,14 @@ export const AgentForm = ({
   initialValues,
 }: AgentFormProps) => {
   const trpc = useTRPC();
-//   const router = useRouter();
+  //   const router = useRouter();
   const queryClient = useQueryClient();
 
   const createAgent = useMutation(
     trpc.agents.create.mutationOptions({
       onSuccess: async () => {
         await queryClient.invalidateQueries(
-            trpc.agents.getMany.queryOptions({})
+          trpc.agents.getMany.queryOptions({})
         );
 
         if (initialValues?.id) {
@@ -56,12 +56,11 @@ export const AgentForm = ({
     })
   );
 
-
   const updateAgent = useMutation(
     trpc.agents.update.mutationOptions({
       onSuccess: async () => {
         await queryClient.invalidateQueries(
-            trpc.agents.getMany.queryOptions({})
+          trpc.agents.getMany.queryOptions({})
         );
         onSuccess?.();
       },
@@ -78,6 +77,15 @@ export const AgentForm = ({
     defaultValues: {
       name: initialValues?.name || "",
       instructions: initialValues?.instructions || "",
+      urls:
+        Array.isArray(initialValues?.urls)
+          ? initialValues.urls
+          : typeof initialValues?.urls === "string"
+          ? initialValues.urls
+              .split(/[\n,]+/)
+              .map((u) => u.trim())
+              .filter(Boolean)
+          : [],
     },
   });
 
@@ -85,12 +93,20 @@ export const AgentForm = ({
   const isPending = createAgent.isPending || updateAgent.isPending;
 
   const onSubmit = (values: z.infer<typeof agentsInsertSchema>) => {
+    console.log("Form submitted with values:", values);
+    const formData = new FormData();
+    formData.append("name", values.name);
+    formData.append("instructions", values.instructions);
+    // if (values.pdf) {
+    //   formData.append("pdf", values.pdf);
+    // }
     if (isEdit) {
       // Handle update logic here
       updateAgent.mutate({ ...values, id: initialValues.id });
       console.log("Update agent:", values);
     } else {
       createAgent.mutate(values);
+      // createAgent.mutate(formData);
     }
   };
 
@@ -123,6 +139,46 @@ export const AgentForm = ({
                 <FormLabel>Instructions</FormLabel>
                 <FormControl>
                   <Textarea {...field} placeholder="Enter agent instructions" />
+                </FormControl>
+              </FormItem>
+            )}
+          />
+          {/* <FormField
+            name="pdf"
+            control={form.control}
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Upload PDF (optional)</FormLabel>
+                <FormControl>
+                  <Input
+                    type="file"
+                    accept="application/pdf"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      field.onChange(file);
+                    }}
+                  />
+                </FormControl>
+              </FormItem>
+            )}
+          /> */}
+          <FormField
+            name="urls"
+            control={form.control}
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Web URLs (optional)</FormLabel>
+                <FormControl>
+                  <Textarea
+                    placeholder="Enter one or more URLs (comma or newline separated)"
+                    onChange={(e) => {
+                      const urls = e.target.value
+                        .split(/[\n,]+/)
+                        .map((url) => url.trim())
+                        .filter(Boolean);
+                      field.onChange(urls);
+                    }}
+                  />
                 </FormControl>
               </FormItem>
             )}
