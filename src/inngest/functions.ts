@@ -9,6 +9,7 @@ import { qdrant } from "@/lib/qdrant";
 import { GeminiAI } from "@/lib/gemini-client";
 import { geminiEmbeddings } from "@/lib/embedding";
 import { randomUUID } from "crypto";
+import stringSimilarity from "string-similarity";
 
 
 const summarizer = createAgent({
@@ -196,84 +197,9 @@ export const generateAgentQuestions = inngest.createFunction(
   }
 );
 
-// export const generateAndStoreEmbeddings = inngest.createFunction(
-//   { id: "generate-and-store-embeddings" },
-//   { event: "agents/generate-embeddings" },
-//   async ({ event, step }) => {
-//     const { agentId, texts } = event.data;
-//     console.log("🔹 Generating embeddings for agent:", agentId);
-
-//     // 1️⃣ Fetch agent info
-//     const agent = await step.run("fetch-agent", async () => {
-//       const res = await db.select().from(agents).where(eq(agents.id, agentId));
-//       return res[0];
-//     });
-
-//     if (!agent) throw new Error("Agent not found");
-
-//     // 2️⃣ Generate embeddings using Gemini
-//     const embeddings = await step.run("generate-embeddings", async () => {
-//       const model = GeminiAI.getGenerativeModel({
-//         model: "text-embedding-004", // ✅ Gemini’s embedding model
-//       });
-
-//       interface EmbeddingResult {
-//         embedding: { values: number[] };
-//       }
-
-//       interface EmbeddingVector {
-//         id: string;
-//         vector: number[];
-//         payload: {
-//           agentId: string;
-//           text: string;
-//         };
-//       }
-
-//       const textsArray = texts as string[];
-//       const vectors: EmbeddingVector[] = await Promise.all(
-//         textsArray.map(async (text: string, idx: number) => {
-//           const result = (await model.embedContent(text)) as EmbeddingResult;
-//           return {
-//         id: `${agentId}-${idx}`,
-//         vector: result.embedding.values,
-//         payload: { agentId, text },
-//           };
-//         })
-//       );
-
-//       return vectors;
-//     });
-
-//     // 3️⃣ Store embeddings in Qdrant
-//     await step.run("store-embeddings", async () => {
-//       await qdrant.upsert("agents", {
-//         points: embeddings.map((e) => ({
-//           id: e.id,
-//           vector: e.vector,
-//           payload: e.payload,
-//         })),
-//       });
-//     });
-
-//     return { success: true };
-//   }
-// );
 
 const VECTOR_SIZE = 3072; // Must match your embedding model
 
-// Ensure collection exists
-// async function ensureCollection() {
-//   const collections = await qdrant.getCollections();
-//   const exists = collections.collections.some(c => c.name === "agents");
-
-//   if (!exists) {
-//     await qdrant.createCollection("agents", {
-//       vectors: { size: VECTOR_SIZE, distance: "Cosine" },
-//     });
-//     console.log("✅ Collection 'agents' created");
-//   }
-// }
 async function ensureCollection() {
   const collections = await qdrant.getCollections();
   const exists = collections.collections.some(c => c.name === "agents");
@@ -311,7 +237,6 @@ async function ensureCollection() {
   console.log(`✅ Collection 'agents' created with vector size ${VECTOR_SIZE}`);
 }
 
-
 // export const generateAndStoreEmbeddings = inngest.createFunction(
 //   { id: "generate-and-store-embeddings" },
 //   { event: "agents/generate-embeddings" },
@@ -319,63 +244,7 @@ async function ensureCollection() {
 //     const { agentId, texts } = event.data;
 //     console.log("🔹 Generating embeddings for agent:", agentId);
 
-//     await ensureCollection();
-
-//     // 1️⃣ Fetch agent info
-//     const agent = await step.run("fetch-agent", async () => {
-//       const res = await db.select().from(agents).where(eq(agents.id, agentId));
-//       return res[0];
-//     });
-
-//     if (!agent) throw new Error("Agent not found");
-
-//     // 2️⃣ Generate embeddings
-//     const embeddings = await step.run("generate-embeddings", async () => {
-//       const model = GeminiAI.getGenerativeModel({ model: "text-embedding-004" });
-
-//       const vectors = await Promise.all(
-//         (texts as string[]).map(async (text: string, idx: number) => {
-//           const result = await model.embedContent(text);
-//           const vector = result.embedding.values;
-
-//           if (vector.length !== VECTOR_SIZE) {
-//             throw new Error(`Invalid embedding length: ${vector.length}, expected ${VECTOR_SIZE}`);
-//           }
-
-//           return {
-//             id: `${agentId}-${idx}`,
-//             vector,
-//             payload: { agentId, text },
-//           };
-//         })
-//       );
-
-//       return vectors;
-//     });
-
-//     // 3️⃣ Store embeddings in Qdrant
-//     await step.run("store-embeddings", async () => {
-//       const points = embeddings.map(e => ({
-//         id: e.id,
-//         vector: e.vector,
-//         payload: e.payload || {},
-//       }));
-
-//       await qdrant.upsert("agents", { points });
-//       console.log(`✅ Stored ${points.length} embeddings for agent ${agentId}`);
-//     });
-
-//     return { success: true };
-//   }
-// );
-
-// export const generateAndStoreEmbeddings = inngest.createFunction(
-//   { id: "generate-and-store-embeddings" },
-//   { event: "agents/generate-embeddings" },
-//   async ({ event, step }) => {
-//     const { agentId, texts } = event.data;
-//     console.log("🔹 Generating embeddings for agent:", agentId);
-
+//     // Ensure collection exists with correct dimensions
 //     await ensureCollection();
 
 //     // 1️⃣ Fetch agent info
@@ -390,60 +259,110 @@ async function ensureCollection() {
 //     const vectors = await step.run("generate-embeddings", async () => {
 //       const textArray = texts as string[];
 //       console.log(`Generating embeddings for ${textArray.length} texts`);
-//       console.log("Text Array sample:", textArray);
+//       console.log("Text Array sample:", textArray.slice(0, 2)); // Only log first 2 for brevity
 
 //       const results = await Promise.all(
 //         textArray.map(async (text, idx) => {
 //           const vector = await geminiEmbeddings.embedQuery(text);
-//           console.log(`Generated embedding for text index ${idx}, length: ${vector.length}`, vector);
+          
+//           // Validate vector dimension
+//           if (vector.length !== VECTOR_SIZE) {
+//             throw new Error(
+//               `Vector dimension mismatch! Expected ${VECTOR_SIZE}, got ${vector.length}`
+//             );
+//           }
+          
+//           console.log(`✅ Generated embedding ${idx + 1}/${textArray.length}, dimension: ${vector.length}`);
 
 //           return {
-//             id: `${agentId}-${idx}`,
+//             // id: `${agentId}-${idx}`,
+//             id: randomUUID(),
 //             vector,
-//             payload: { agentId, text: text.substring(0, 1000), textIndex: idx }, // Truncate text to first 1000 chars
+//             payload: { 
+//               agentId, 
+//               text: text.substring(0, 1000), // Truncate text to first 1000 chars
+//               textIndex: idx 
+//             },
 //           };
 //         })
 //       );
 
+//       console.log(`✅ Generated ${results.length} embeddings`);
 //       return results;
 //     });
 
 //     // 3️⃣ Store embeddings in Qdrant
-//     await step.run("store-embeddings", async () => {
+//     const result = await step.run("store-embeddings", async () => {
 //       try {
+//         // Verify collection configuration
+//         const collectionInfo = await qdrant.getCollection("agents");
+//         const collectionVectorSize = 
+//           (collectionInfo as any).vectors?.size ??
+//           (collectionInfo as any).config?.vectors?.size ??
+//           (collectionInfo as any).config?.params?.vectors?.size;
+
+//         console.log(`📊 Collection vector size: ${collectionVectorSize}`);
+        
+//         if (collectionVectorSize !== VECTOR_SIZE) {
+//           throw new Error(
+//             `Collection dimension mismatch! Collection has ${collectionVectorSize}, embeddings have ${VECTOR_SIZE}`
+//           );
+//         }
 
 //         const points = vectors.map(e => ({
 //           id: e.id,
 //           vector: e.vector,
 //           payload: e.payload,
 //         }));
-//         console.log(`📦 Preparing to upsert ${points.length} points`);
-//         console.log(`📏 Sample vector dimension: ${points[0].vector.length}`);
-//         console.log("📝 Sample payload:", points[0].payload);
-//         console.log("🔢 Sample point:", points[0]);
-//         console.log("🚀 Upserting points to Qdrant...", points);
 
+//         console.log(`📦 Upserting ${points.length} points to Qdrant`);
+//         console.log(`📏 First vector dimension: ${points[0].vector.length}`);
+//         console.log(`📝 Sample payload:`, points[0].payload);
 
-
-//         await qdrant.upsert("agents", { points, wait: true });
-//         console.log(`✅ Stored ${points.length} embeddings for agent ${agentId}`);
-//       } catch (error) {
-//         console.error("❌ Error storing embeddings in Qdrant:", error);
+//         const upsertResult = await qdrant.upsert("agents", { 
+//           points, 
+//           wait: true 
+//         });
+        
+//         console.log(`✅ Successfully stored ${points.length} embeddings for agent ${agentId}`);
+//         console.log(`📊 Upsert result:`, upsertResult);
+        
+//         return { success: true, pointsStored: points.length };
+//       } catch (error: any) {
+//         console.error("❌ Error storing embeddings in Qdrant:");
+//         console.error("❌ Error message:", error.message);
+//         console.error("❌ Error status:", error.status);
+//         console.error("❌ Error data:", JSON.stringify(error.data, null, 2));
+//         console.error("❌ Full error:", error);
+        
+//         // Re-throw to mark step as failed
+//         throw new Error(`Failed to store embeddings: ${error.message}`);
 //       }
 //     });
 
-//     return { success: true, pointsStored: vectors.length, agentId };
+//     return { 
+//       success: true, 
+//       pointsStored: result.pointsStored, 
+//       agentId 
+//     };
 //   }
 // );
+
+interface PageData {
+  url: string;
+  text: string;
+}
 
 export const generateAndStoreEmbeddings = inngest.createFunction(
   { id: "generate-and-store-embeddings" },
   { event: "agents/generate-embeddings" },
   async ({ event, step }) => {
-    const { agentId, texts } = event.data;
-    console.log("🔹 Generating embeddings for agent:", agentId);
+    const { agentId, pages } = event.data as { agentId: string; pages: PageData[] };
+    if (!pages || pages.length === 0) {
+      throw new Error("No pages provided for embeddings generation");
+    }
 
-    // Ensure collection exists with correct dimensions
+    console.log(`🔹 Generating embeddings for agent: ${agentId}`);
     await ensureCollection();
 
     // 1️⃣ Fetch agent info
@@ -451,98 +370,133 @@ export const generateAndStoreEmbeddings = inngest.createFunction(
       const res = await db.select().from(agents).where(eq(agents.id, agentId));
       return res[0];
     });
-
     if (!agent) throw new Error("Agent not found");
 
-    // 2️⃣ Generate embeddings using LangChain Gemini Embeddings
-    const vectors = await step.run("generate-embeddings", async () => {
-      const textArray = texts as string[];
-      console.log(`Generating embeddings for ${textArray.length} texts`);
-      console.log("Text Array sample:", textArray.slice(0, 2)); // Only log first 2 for brevity
+    // 2️⃣ Split pages into semantic sections and paragraph chunks
+    const chunks: {
+      url: string;
+      section: string;
+      chunkText: string;
+      chunkIndex: number;
+    }[] = [];
 
-      const results = await Promise.all(
-        textArray.map(async (text, idx) => {
-          const vector = await geminiEmbeddings.embedQuery(text);
-          
-          // Validate vector dimension
+    const MAX_CHARS = 1000;   // max chars per chunk
+    const OVERLAP = 200;      // chars overlap between chunks
+
+    console.log(`📄 Splitting ${pages.length} pages into chunks`);
+    console.log(`📏 Max chars per chunk: ${MAX_CHARS}`);
+    console.log(`🔄 Overlap between chunks: ${OVERLAP}`);
+    console.log(`----------------------------------------`, pages);
+
+    const validPages = pages.filter(p => p.text && p.text.trim().length > 0);
+
+    validPages.forEach(page => {
+      const lines = page.text.split("\n").map(l => l.trim()).filter(Boolean);
+      let currentHeading = "Introduction";
+      let currentContent: string[] = [];
+
+      lines.forEach(line => {
+        if (/^#{1,3}\s/.test(line) || line.length < 100) {
+          // Treat short lines or markdown headings as heading
+          if (currentContent.length) {
+            const sectionText = currentContent.join("\n");
+            // Chunk section text with overlap
+            let start = 0, chunkIndex = 0;
+            while (start < sectionText.length) {
+              const end = Math.min(start + MAX_CHARS, sectionText.length);
+              const chunk = sectionText.slice(start, end);
+              chunks.push({
+                url: page.url,
+                section: currentHeading,
+                chunkText: chunk,
+                chunkIndex
+              });
+              chunkIndex++;
+              start += MAX_CHARS - OVERLAP;
+            }
+          }
+          currentHeading = line;
+          currentContent = [];
+        } else {
+          currentContent.push(line);
+        }
+      });
+
+      // Handle last section
+      if (currentContent.length) {
+        const sectionText = currentContent.join("\n");
+        let start = 0, chunkIndex = 0;
+        while (start < sectionText.length) {
+          const end = Math.min(start + MAX_CHARS, sectionText.length);
+          const chunk = sectionText.slice(start, end);
+          chunks.push({
+            url: page.url,
+            section: currentHeading,
+            chunkText: chunk,
+            chunkIndex
+          });
+          chunkIndex++;
+          start += MAX_CHARS - OVERLAP;
+        }
+      }
+    });
+
+    console.log(`📄 Total chunks extracted: ${chunks.length}`);
+
+    // 3️⃣ Deduplicate chunks (optional but recommended)
+    const uniqueChunks: typeof chunks = [];
+    chunks.forEach(chunk => {
+      const isDuplicate = uniqueChunks.some(u =>
+        stringSimilarity.compareTwoStrings(u.chunkText, chunk.chunkText) > 0.9
+      );
+      if (!isDuplicate) uniqueChunks.push(chunk);
+    });
+    console.log(`✅ Unique chunks after deduplication: ${uniqueChunks.length}`);
+
+    // 4️⃣ Generate embeddings
+    const vectors = await step.run("generate-embeddings", async () => {
+      return Promise.all(
+        uniqueChunks.map(async (chunk) => {
+          const vector = await geminiEmbeddings.embedQuery(chunk.chunkText);
+
           if (vector.length !== VECTOR_SIZE) {
             throw new Error(
               `Vector dimension mismatch! Expected ${VECTOR_SIZE}, got ${vector.length}`
             );
           }
-          
-          console.log(`✅ Generated embedding ${idx + 1}/${textArray.length}, dimension: ${vector.length}`);
 
           return {
-            // id: `${agentId}-${idx}`,
             id: randomUUID(),
             vector,
-            payload: { 
-              agentId, 
-              text: text.substring(0, 1000), // Truncate text to first 1000 chars
-              textIndex: idx 
-            },
+            payload: {
+              agentId,
+              url: chunk.url,
+              section: chunk.section,
+              text: chunk.chunkText,
+              chunkIndex: chunk.chunkIndex
+            }
           };
         })
       );
-
-      console.log(`✅ Generated ${results.length} embeddings`);
-      return results;
     });
 
-    // 3️⃣ Store embeddings in Qdrant
+    console.log(`📊 Generated ${vectors.length} embeddings`);
+
+    // 5️⃣ Store embeddings in Qdrant
     const result = await step.run("store-embeddings", async () => {
-      try {
-        // Verify collection configuration
-        const collectionInfo = await qdrant.getCollection("agents");
-        const collectionVectorSize = 
-          (collectionInfo as any).vectors?.size ??
-          (collectionInfo as any).config?.vectors?.size ??
-          (collectionInfo as any).config?.params?.vectors?.size;
+      const points = vectors.map(v => ({
+        id: v.id,
+        vector: v.vector,
+        payload: v.payload
+      }));
 
-        console.log(`📊 Collection vector size: ${collectionVectorSize}`);
-        
-        if (collectionVectorSize !== VECTOR_SIZE) {
-          throw new Error(
-            `Collection dimension mismatch! Collection has ${collectionVectorSize}, embeddings have ${VECTOR_SIZE}`
-          );
-        }
+      console.log(`📦 Upserting ${points.length} points to Qdrant`);
+      const upsertResult = await qdrant.upsert("agents", { points, wait: true });
+      console.log(`✅ Successfully stored embeddings for agent ${agentId}`, upsertResult);
 
-        const points = vectors.map(e => ({
-          id: e.id,
-          vector: e.vector,
-          payload: e.payload,
-        }));
-
-        console.log(`📦 Upserting ${points.length} points to Qdrant`);
-        console.log(`📏 First vector dimension: ${points[0].vector.length}`);
-        console.log(`📝 Sample payload:`, points[0].payload);
-
-        const upsertResult = await qdrant.upsert("agents", { 
-          points, 
-          wait: true 
-        });
-        
-        console.log(`✅ Successfully stored ${points.length} embeddings for agent ${agentId}`);
-        console.log(`📊 Upsert result:`, upsertResult);
-        
-        return { success: true, pointsStored: points.length };
-      } catch (error: any) {
-        console.error("❌ Error storing embeddings in Qdrant:");
-        console.error("❌ Error message:", error.message);
-        console.error("❌ Error status:", error.status);
-        console.error("❌ Error data:", JSON.stringify(error.data, null, 2));
-        console.error("❌ Full error:", error);
-        
-        // Re-throw to mark step as failed
-        throw new Error(`Failed to store embeddings: ${error.message}`);
-      }
+      return { success: true, pointsStored: points.length };
     });
 
-    return { 
-      success: true, 
-      pointsStored: result.pointsStored, 
-      agentId 
-    };
+    return { success: true, pointsStored: result.pointsStored, agentId };
   }
 );

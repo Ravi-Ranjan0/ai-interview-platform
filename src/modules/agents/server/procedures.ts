@@ -10,6 +10,8 @@ import { inngest } from "@/inngest/client";
 import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
 import { CheerioWebBaseLoader } from "@langchain/community/document_loaders/web/cheerio";
 import { PlaywrightWebBaseLoader } from "@langchain/community/document_loaders/web/playwright";
+import { chromium } from "playwright";
+import { crawlWebsitePlaywright } from "@/utils/web-crawler";
 
 
 export const agentsRouter = createTRPCRouter({
@@ -139,7 +141,8 @@ export const agentsRouter = createTRPCRouter({
             };
         }),
 
-    create: protectedProcedure.input(agentsInsertSchema)
+    create: protectedProcedure
+        .input(agentsInsertSchema)
         .mutation(async ({ input, ctx }) => {
             const insertPayload = {
                 ...input,
@@ -151,80 +154,110 @@ export const agentsRouter = createTRPCRouter({
                 .insert(agents)
                 .values(insertPayload)
                 .returning();
+            // if (input.urls && input.urls.length > 0) {
+            //     try {
+            //         console.log("🌍 Loading content from URLs:", input.urls);
+
+            //         const allTexts: string[] = [];
+            //         for (const url of input.urls) {
+            //             try {
+            //                 const loader = new PlaywrightWebBaseLoader(url, {
+            //                     launchOptions: {
+            //                         headless: true,
+            //                     },
+            //                     gotoOptions: {
+            //                         waitUntil: "domcontentloaded", // Wait for JS to load
+            //                     },
+            //                     evaluate: async (page) => {
+            //                         // Extract ONLY readable text from the main content area
+            //                         return await page.$eval("main", (el) => el.innerText);
+            //                     },
+            //                 });
+
+            //                 console.log(`🔗 Loading content (JS-enabled): ${url}`);
+            //                 const docs = await loader.load();
+
+            //                 console.log(`📄 Retrieved documents from ${url}`, docs);
+
+            //                 const urlTexts = docs.map((d: any) => d.pageContent).filter(Boolean);
+            //                 console.log(`✅ Extracted ${urlTexts.length} text chunks from ${url}`);
+
+            //                 allTexts.push(...urlTexts);
+            //             } catch (err) {
+            //                 console.error(`❌ Failed to scrape ${url}:`, err);
+            //             }
+            //         }
+
+
+
+
+            //         if (allTexts.length > 0) {
+            //             console.log(`📚 Total extracted text chunks from all URLs: ${allTexts.length}`);
+            //             await inngest.send({
+            //                 name: "agents/generate-embeddings",
+            //                 data: {
+            //                     agentId: createdAgent.id,
+            //                     texts: allTexts,
+            //                     url: input.urls[0], // Pass the first URL for reference
+            //                 },
+            //             });
+            //             console.log("🚀 Triggered embeddings generation via Inngest (Web URLs)");
+            //         } else {
+            //             console.warn("⚠️ No valid text extracted from provided URLs");
+            //         }
+            //     } catch (err) {
+            //         console.error("❌ Error while processing URLs:", err);
+            //         throw new TRPCError({
+            //             code: "INTERNAL_SERVER_ERROR",
+            //             message: "Failed to process and embed the provided URLs",
+            //         });
+            //     }
+            // }
+
             if (input.urls && input.urls.length > 0) {
+                // const allTexts: string[] = [];
+                const allPages: { url: string; text: string }[] = [];
+                const visitedUrls = new Set<string>();
+
+                const browser = await chromium.launch({ headless: true });
+
                 try {
-                    console.log("🌍 Loading content from URLs:", input.urls);
-
-                    const allTexts: string[] = [];
-
-                    // for (const url of input.urls) {
-                    //     try {
-                    //         const loader = new CheerioWebBaseLoader(url);
-                    //         console.log(`🔗 Fetching and parsing content from: ${url}`, loader);
-                    //         const docs = await loader.load();
-                    //         console.log(`📄 Retrieved ${docs.length} documents from ${url}`, docs);
-                    //         const urlTexts = docs.map((d: any) => d.pageContent).filter(Boolean);
-                    //         console.log(`✅ Extracted ${urlTexts.length} text chunks from ${url}`);
-                    //         allTexts.push(...urlTexts);
-                    //     } catch (err) {
-                    //         console.error(`❌ Failed to process ${url}:`, err);
-                    //     }
-                    // }
-
                     for (const url of input.urls) {
-                        try {
-                            const loader = new PlaywrightWebBaseLoader(url, {
-                                launchOptions: {
-                                    headless: true,
-                                },
-                                gotoOptions: {
-                                    waitUntil: "domcontentloaded", // Wait for JS to load
-                                },
-                                evaluate: async (page) => {
-                                    // Extract ONLY readable text from the main content area
-                                    return await page.$eval("main", (el) => el.innerText);
-                                },
-                            });
-
-                            console.log(`🔗 Loading content (JS-enabled): ${url}`);
-                            const docs = await loader.load();
-
-                            console.log(`📄 Retrieved documents from ${url}`, docs);
-
-                            const urlTexts = docs.map((d: any) => d.pageContent).filter(Boolean);
-                            console.log(`✅ Extracted ${urlTexts.length} text chunks from ${url}`);
-
-                            allTexts.push(...urlTexts);
-                        } catch (err) {
-                            console.error(`❌ Failed to scrape ${url}:`, err);
-                        }
+                        await crawlWebsitePlaywright(
+                            url,
+                            allPages,
+                            browser,
+                            3, // maxDepth
+                            0, // currentDepth
+                            visitedUrls,
+                            10
+                        );
                     }
+                } finally {
+                    await browser.close();
+                }
 
+                console.log(`📚 Total extracted text chunks from all URLs: ${allPages.length}`);
+                console.log(`🔗 Crawled URLs:`, Array.from(visitedUrls));
+                console.log(`🔗 Crawled a total of ${visitedUrls.size} unique URLs`);
+                console.log(`📚 Extracted a total of ${allPages.length} text chunks from crawled URLs`);
 
-
-
-                    if (allTexts.length > 0) {
-                        console.log(`📚 Total extracted text chunks from all URLs: ${allTexts.length}`);
-                        await inngest.send({
-                            name: "agents/generate-embeddings",
-                            data: {
-                                agentId: createdAgent.id,
-                                texts: allTexts,
-                                url: input.urls[0], // Pass the first URL for reference
-                            },
-                        });
-                        console.log("🚀 Triggered embeddings generation via Inngest (Web URLs)");
-                    } else {
-                        console.warn("⚠️ No valid text extracted from provided URLs");
-                    }
-                } catch (err) {
-                    console.error("❌ Error while processing URLs:", err);
-                    throw new TRPCError({
-                        code: "INTERNAL_SERVER_ERROR",
-                        message: "Failed to process and embed the provided URLs",
+                if (allPages.length > 0) {
+                    await inngest.send({
+                        name: "agents/generate-embeddings",
+                        data: {
+                            agentId: createdAgent.id,
+                            // texts: allTexts,
+                            pages: allPages.map(page => ({ url: page.url, text: page.text })),
+                            url: input.urls[0], // reference first URL
+                        },
                     });
+                    console.log("🚀 Triggered embeddings generation via Inngest");
+                } else {
+                    console.warn("⚠️ No valid text extracted from provided URLs");
                 }
             }
+
 
             // await inngest.send({
             //     name: "agents/questions",
