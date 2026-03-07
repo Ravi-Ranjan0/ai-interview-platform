@@ -2,7 +2,7 @@ import { StreamTranscriptItem } from "@/modules/meetings/type";
 import { inngest } from "./client";
 import JSONL from "jsonl-parse-stringify";
 import { db } from "@/db";
-import { agents, meetings, user } from "@/db/schema";
+import { agents, meetings, messages, user } from "@/db/schema";
 import { eq, inArray } from "drizzle-orm";
 import { createAgent, openai, gemini, TextMessage, } from "@inngest/agent-kit";
 import { qdrant } from "@/lib/qdrant";
@@ -264,14 +264,14 @@ async function ensureCollection() {
 //       const results = await Promise.all(
 //         textArray.map(async (text, idx) => {
 //           const vector = await geminiEmbeddings.embedQuery(text);
-          
+
 //           // Validate vector dimension
 //           if (vector.length !== VECTOR_SIZE) {
 //             throw new Error(
 //               `Vector dimension mismatch! Expected ${VECTOR_SIZE}, got ${vector.length}`
 //             );
 //           }
-          
+
 //           console.log(`✅ Generated embedding ${idx + 1}/${textArray.length}, dimension: ${vector.length}`);
 
 //           return {
@@ -302,7 +302,7 @@ async function ensureCollection() {
 //           (collectionInfo as any).config?.params?.vectors?.size;
 
 //         console.log(`📊 Collection vector size: ${collectionVectorSize}`);
-        
+
 //         if (collectionVectorSize !== VECTOR_SIZE) {
 //           throw new Error(
 //             `Collection dimension mismatch! Collection has ${collectionVectorSize}, embeddings have ${VECTOR_SIZE}`
@@ -323,10 +323,10 @@ async function ensureCollection() {
 //           points, 
 //           wait: true 
 //         });
-        
+
 //         console.log(`✅ Successfully stored ${points.length} embeddings for agent ${agentId}`);
 //         console.log(`📊 Upsert result:`, upsertResult);
-        
+
 //         return { success: true, pointsStored: points.length };
 //       } catch (error: any) {
 //         console.error("❌ Error storing embeddings in Qdrant:");
@@ -334,7 +334,7 @@ async function ensureCollection() {
 //         console.error("❌ Error status:", error.status);
 //         console.error("❌ Error data:", JSON.stringify(error.data, null, 2));
 //         console.error("❌ Full error:", error);
-        
+
 //         // Re-throw to mark step as failed
 //         throw new Error(`Failed to store embeddings: ${error.message}`);
 //       }
@@ -500,3 +500,82 @@ export const generateAndStoreEmbeddings = inngest.createFunction(
     return { success: true, pointsStored: result.pointsStored, agentId };
   }
 );
+
+
+export const instructionOnlyAgent = createAgent({
+  name: "instruction-only-agent",
+  system: `
+You are an assistant whose knowledge is ONLY the "INSTRUCTIONS" block provided below.
+You MUST answer user questions using solely the information inside INSTRUCTIONS.
+Do NOT access external knowledge, do not guess, do not hallucinate, and do not answer with anything outside INSTRUCTIONS.
+If a question cannot be answered using the INSTRUCTIONS exactly, reply only with:
+"I don't know based on the given information."
+
+Strict output rules:
+- Answer concisely and directly.
+- If the answer exists in the INSTRUCTIONS, provide it (full sentences are fine).
+- If it does not, use exactly: "I don't know based on the given information."
+- Do not include extra commentary, meta explanation, or questions back to the user.
+
+INSTRUCTIONS:
+{{INSTRUCTIONS_PLACEHOLDER}}
+`.trim(),
+  model: gemini({
+    model: "gemini-1.5-flash-8b",
+    apiKey: process.env.GEMINI_API_KEY,
+  }),
+});
+
+export const agentChatHandler = inngest.createFunction(
+  { id: "agent-chat-handler-instruction-only" },
+  { event: "agent/message" },
+  async ({ event, step }) => {
+    const { agentId, conversationId, userId, content } = event.data;
+    console.log("🚀 agentChatHandler fired for agent:", agentId);
+
+    // 1) Fetch agent record
+    const agent = await step.run("fetch-agent", async () => {
+      const res = await db.select().from(agents).where(eq(agents.id, agentId));
+      return res[0];
+    });
+
+    if (!agent) throw new Error("Agent not found");
+
+    const instructionsText = agent.instructions ?? "";
+    console.log("Agent instructions fetched, length:", instructionsText);
+
+    // 2) Build prompt
+    const prompt = `
+You are an assistant whose knowledge is ONLY the provided instructions.
+If the user asks anything not covered, respond exactly with:
+"I don't know based on the given information."
+
+INSTRUCTIONS:
+${instructionsText}
+
+USER QUESTION:
+${content}
+`.trim();
+
+
+    // ✅ DO NOT wrap this in step.run — avoids nested steps
+    const { output } = await instructionOnlyAgent.run(prompt);
+    console.log("Agent response generated.", output);
+
+    const reply = (output[0] as TextMessage).content as string;
+    console.log("Agent reply generated:", reply);
+
+    // 3) Save reply — safe to use step.run here
+    await step.run("save-agent-reply", async () => {
+      await db.insert(messages).values({
+        conversationId,
+        userId: agent.id, // agent is the speaker
+        sender: "agent",
+        content: reply,
+      });
+    });
+
+    return { success: true, reply };
+  }
+);
+

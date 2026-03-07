@@ -86,3 +86,12 @@ export const conversations = pgTable("conversations", {
   createdAt: timestamp('created_at').notNull().defaultNow(),
   updatedAt: timestamp('updated_at').notNull().defaultNow(),
 });
+
+export const messages = pgTable("messages", {
+  id: text('id').primaryKey().$defaultFn(() => nanoid()),
+  conversationId: text('conversation_id').notNull().references(() => conversations.id, { onDelete: 'cascade' }),
+  userId: text('user_id').notNull().references(() => user.id, { onDelete: 'cascade' }),
+  sender: text('sender').notNull(), // 'user' or 'agent'
+  content: text('content').notNull(),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+});

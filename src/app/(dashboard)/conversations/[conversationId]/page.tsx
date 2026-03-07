@@ -1,3 +1,4 @@
+import { ChatView } from "@/modules/chat/ui/views/chat-view";
 import { ConversationIdView, ConversationIdViewError, ConversationIdViewLoading } from "@/modules/conversations/ui/views/conversation-id-view";
 import { getQueryClient, trpc } from "@/trpc/server";
 import { dehydrate, HydrationBoundary } from "@tanstack/react-query";
@@ -21,7 +22,8 @@ const Page = async ({ params }: Props) => {
         <HydrationBoundary state={dehydrate(queryClient)}>
             <Suspense fallback={<ConversationIdViewLoading />}>
             <ErrorBoundary fallback={<ConversationIdViewError />}>
-                <ConversationIdView conversationId={conversationId} />
+                {/* <ConversationIdView conversationId={conversationId} /> */}
+                <ChatView conversationId={conversationId} />
             </ErrorBoundary>
             </Suspense>
         </HydrationBoundary>

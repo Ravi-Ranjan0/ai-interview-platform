@@ -259,12 +259,12 @@ export const agentsRouter = createTRPCRouter({
             }
 
 
-            // await inngest.send({
-            //     name: "agents/questions",
-            //     data: {
-            //         agentId: createdAgent.id
-            //     },
-            // })
+            await inngest.send({
+                name: "agents/questions",
+                data: {
+                    agentId: createdAgent.id
+                },
+            })
 
             return createdAgent;
         }),
