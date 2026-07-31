@@ -46,9 +46,7 @@ export const ChatConnect = ({
 
     await sendMessage({
       conversationId,
-      sender: "user",
       content: message,
-      userId, // ✅ IMPORTANT
     });
 
     setMessage("");

@@ -1,5 +1,5 @@
 import { db } from "@/db";
-import { agents } from "@/db/schema";
+import { agents, meetings } from "@/db/schema";
 import { createTRPCRouter, protectedProcedure } from "@/trpc/init";
 import { agentsInsertSchema, agentsUpdateSchema } from "../schema";
 import z from "zod";
@@ -7,9 +7,6 @@ import { eq, getTableColumns, count, sql, and, ilike, desc } from "drizzle-orm";
 import { DEFAULT_PAGE, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MIN_PAGE_SIZE } from "@/constant";
 import { TRPCError } from "@trpc/server";
 import { inngest } from "@/inngest/client";
-import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
-import { CheerioWebBaseLoader } from "@langchain/community/document_loaders/web/cheerio";
-import { PlaywrightWebBaseLoader } from "@langchain/community/document_loaders/web/playwright";
 import { chromium } from "playwright";
 import { crawlWebsitePlaywright } from "@/utils/web-crawler";
 
@@ -73,7 +70,7 @@ export const agentsRouter = createTRPCRouter({
         .query(async ({ ctx, input }) => {
             const [existingAgent] = await db
                 .select({
-                    meetingCount: sql<number>`5`,
+                    meetingCount: sql<number>`(SELECT COUNT(*)::int FROM ${meetings} WHERE ${meetings.agentId} = ${agents.id})`,
                     last_Response: agents.lastResponse,
                     ...getTableColumns(agents),
                 })
@@ -111,7 +108,7 @@ export const agentsRouter = createTRPCRouter({
             const data = await db
                 .select(
                     {
-                        meetingCount: sql<number>`5`,
+                        meetingCount: sql<number>`(SELECT COUNT(*)::int FROM ${meetings} WHERE ${meetings.agentId} = ${agents.id})`,
                         ...getTableColumns(agents),
                     }
                 )
@@ -160,65 +157,6 @@ export const agentsRouter = createTRPCRouter({
                 .insert(agents)
                 .values(insertPayload)
                 .returning();
-            // if (input.urls && input.urls.length > 0) {
-            //     try {
-            //         console.log("🌍 Loading content from URLs:", input.urls);
-
-            //         const allTexts: string[] = [];
-            //         for (const url of input.urls) {
-            //             try {
-            //                 const loader = new PlaywrightWebBaseLoader(url, {
-            //                     launchOptions: {
-            //                         headless: true,
-            //                     },
-            //                     gotoOptions: {
-            //                         waitUntil: "domcontentloaded", // Wait for JS to load
-            //                     },
-            //                     evaluate: async (page) => {
-            //                         // Extract ONLY readable text from the main content area
-            //                         return await page.$eval("main", (el) => el.innerText);
-            //                     },
-            //                 });
-
-            //                 console.log(`🔗 Loading content (JS-enabled): ${url}`);
-            //                 const docs = await loader.load();
-
-            //                 console.log(`📄 Retrieved documents from ${url}`, docs);
-
-            //                 const urlTexts = docs.map((d: any) => d.pageContent).filter(Boolean);
-            //                 console.log(`✅ Extracted ${urlTexts.length} text chunks from ${url}`);
-
-            //                 allTexts.push(...urlTexts);
-            //             } catch (err) {
-            //                 console.error(`❌ Failed to scrape ${url}:`, err);
-            //             }
-            //         }
-
-
-
-
-            //         if (allTexts.length > 0) {
-            //             console.log(`📚 Total extracted text chunks from all URLs: ${allTexts.length}`);
-            //             await inngest.send({
-            //                 name: "agents/generate-embeddings",
-            //                 data: {
-            //                     agentId: createdAgent.id,
-            //                     texts: allTexts,
-            //                     url: input.urls[0], // Pass the first URL for reference
-            //                 },
-            //             });
-            //             console.log("🚀 Triggered embeddings generation via Inngest (Web URLs)");
-            //         } else {
-            //             console.warn("⚠️ No valid text extracted from provided URLs");
-            //         }
-            //     } catch (err) {
-            //         console.error("❌ Error while processing URLs:", err);
-            //         throw new TRPCError({
-            //             code: "INTERNAL_SERVER_ERROR",
-            //             message: "Failed to process and embed the provided URLs",
-            //         });
-            //     }
-            // }
 
             if (input.urls && input.urls.length > 0) {
                 // const allTexts: string[] = [];

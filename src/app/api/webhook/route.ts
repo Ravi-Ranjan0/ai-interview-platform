@@ -5,6 +5,47 @@ import { streamVideo } from "@/lib/stream-video";
 import { CallEndedEvent, CallRecordingReadyEvent, CallSessionParticipantLeftEvent, CallSessionStartedEvent, CallTranscriptionReadyEvent } from "@stream-io/node-sdk";
 import { and, eq, not } from "drizzle-orm";
 import { NextRequest, NextResponse } from "next/server";
+import { qdrant } from "@/lib/qdrant";
+
+// ponytail: static per-session RAG context — pull top-K agent-scoped chunks
+// with no query filter and inline them into the instructions. Upgrade path:
+// register a Stream/OpenAI tool for mid-conversation retrieval.
+const RAG_CONTEXT_LIMIT = 20;
+const RAG_CONTEXT_CHAR_CAP = 6000;
+
+async function buildAgentSessionContext(agentId: string): Promise<string> {
+    try {
+        const result = await qdrant.scroll("agents", {
+            filter: { must: [{ key: "agentId", match: { value: agentId } }] },
+            limit: RAG_CONTEXT_LIMIT,
+            with_payload: true,
+            with_vector: false,
+        });
+        const points = result.points ?? [];
+        if (points.length === 0) return "";
+        let total = 0;
+        const parts: string[] = [];
+        for (const p of points) {
+            const payload = p.payload as {
+                text?: string;
+                url?: string;
+                fileName?: string;
+                section?: string;
+            } | null;
+            const text = payload?.text?.trim();
+            if (!text) continue;
+            const source = payload?.fileName ?? payload?.url ?? "knowledge base";
+            const block = `[${source}${payload?.section ? ` · ${payload.section}` : ""}]\n${text}`;
+            if (total + block.length > RAG_CONTEXT_CHAR_CAP) break;
+            parts.push(block);
+            total += block.length;
+        }
+        return parts.join("\n\n---\n\n");
+    } catch (err) {
+        console.error(`Failed to build RAG context for agent ${agentId}:`, err);
+        return "";
+    }
+}
 
 
 
@@ -82,8 +123,13 @@ export async function POST(req: NextRequest) {
             agentUserId: existingAgent.id,
         });
 
+        const ragContext = await buildAgentSessionContext(existingAgent.id);
+        const sessionInstructions = ragContext
+            ? `${existingAgent.instructions}\n\nREFERENCE MATERIAL (from the candidate's uploaded documents and crawled sources — cite briefly when you use it):\n${ragContext}`
+            : existingAgent.instructions;
+
         await realTimeClient.updateSession({
-            instructions: existingAgent.instructions,
+            instructions: sessionInstructions,
         });
 
 
@@ -129,7 +175,10 @@ export async function POST(req: NextRequest) {
 
         // Call inngest 
 
+        // ponytail: id-scoped dedupe so a Stream retry doesn't run the
+        // summarizer twice per meeting. Upgrade path: per-event dedupe table.
         await inngest.send({
+            id: `meetings-processing-${updatedMeeting.id}`,
             name: "meetings/processing",
             data: {
                 meetingId: updatedMeeting.id,
