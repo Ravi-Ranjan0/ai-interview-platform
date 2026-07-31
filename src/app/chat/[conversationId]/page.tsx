@@ -32,3 +32,5 @@ const Page = async ({params}: Props) => {
         <div>Conversation Page for ID: {conversationId}</div>
     );
 }
+
+export default Page;

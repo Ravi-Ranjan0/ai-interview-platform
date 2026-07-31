@@ -1,4 +1,4 @@
-import { DEFAULT_PAGE, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MIN_PAGE_SIZE } from "@/constant";
+import { DEFAULT_PAGE, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "@/constant";
 import { db } from "@/db";
 import { agents, conversations } from "@/db/schema";
 import { createTRPCRouter, protectedProcedure } from "@/trpc/init";
@@ -36,7 +36,7 @@ export const conversationsRouter = createTRPCRouter({
         .input(
             z.object({
                 page: z.number().default(DEFAULT_PAGE),
-                pageSize: z.number().min(MIN_PAGE_SIZE).max(MAX_PAGE_SIZE).default(DEFAULT_PAGE_SIZE),
+                pageSize: z.number().min(1).max(MAX_PAGE_SIZE).default(DEFAULT_PAGE_SIZE),
                 search: z.string().nullish(),
                 agentId: z.string().nullish(),
             })

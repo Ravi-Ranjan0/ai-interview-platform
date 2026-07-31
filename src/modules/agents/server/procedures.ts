@@ -4,7 +4,7 @@ import { createTRPCRouter, protectedProcedure } from "@/trpc/init";
 import { agentsInsertSchema, agentsUpdateSchema } from "../schema";
 import z from "zod";
 import { eq, getTableColumns, count, sql, and, ilike, desc } from "drizzle-orm";
-import { DEFAULT_PAGE, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MIN_PAGE_SIZE } from "@/constant";
+import { DEFAULT_PAGE, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "@/constant";
 import { TRPCError } from "@trpc/server";
 import { inngest } from "@/inngest/client";
 import { chromium } from "playwright";
@@ -96,7 +96,7 @@ export const agentsRouter = createTRPCRouter({
                 page: z.number().default(DEFAULT_PAGE),
                 pageSize: z
                     .number()
-                    .min(MIN_PAGE_SIZE)
+                    .min(1)
                     .max(MAX_PAGE_SIZE)
                     .default(DEFAULT_PAGE_SIZE),
                 search: z.string().nullish(),

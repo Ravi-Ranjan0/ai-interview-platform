@@ -1,5 +1,7 @@
 import * as cheerio from "cheerio";
-import { GeminiAI } from "@/lib/gemini-client";
+import { GoogleGenerativeAI } from "@google/generative-ai";
+
+const GeminiAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 
 /**
  * Extract clean text content from raw HTML using Cheerio.

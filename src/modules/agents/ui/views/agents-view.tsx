@@ -7,7 +7,7 @@ import { useQuery, useSuspenseQuery } from "@tanstack/react-query";
 import { columns } from "../components/columns";
 import { EmptyState } from "@/components/empty-state";
 import { useAgentsFilters } from "../../hooks/use-agents-filters";
-import { DataPagination } from "../components/data-pagination";
+import { DataPagination } from "@/components/data-pagination";
 import { useRouter } from "next/navigation";
 import { DataTable } from "@/components/data-table";
 
