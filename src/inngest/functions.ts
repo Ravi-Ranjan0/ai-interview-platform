@@ -2,14 +2,35 @@ import { StreamTranscriptItem } from "@/modules/meetings/type";
 import { inngest } from "./client";
 import JSONL from "jsonl-parse-stringify";
 import { db } from "@/db";
-import { agents, meetings, messages, user } from "@/db/schema";
+import { agents, meetings, messages, user, documents } from "@/db/schema";
 import { eq, inArray } from "drizzle-orm";
 import { createAgent, openai, gemini, TextMessage, } from "@inngest/agent-kit";
-import { qdrant } from "@/lib/qdrant";
+import { qdrant, ensureAgentCollection } from "@/lib/qdrant";
 import { GeminiAI } from "@/lib/gemini-client";
-import { geminiEmbeddings } from "@/lib/embedding";
+import { geminiEmbeddings, VECTOR_SIZE } from "@/lib/embedding";
 import { randomUUID } from "crypto";
 import stringSimilarity from "string-similarity";
+
+// ponytail: 5-at-a-time cap avoids Gemini 429s on large docs. Upgrade path:
+// swap for p-limit if we ever need per-key concurrency across events.
+const EMBED_CONCURRENCY = 5;
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const i = cursor++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
 
 
 const summarizer = createAgent({
@@ -35,7 +56,7 @@ Example:
 - Mention of integration with Z`
     .trim(),
   model: gemini({
-    model: "gemini-1.5-flash-8b",
+    model: "gemini-1.5-flash",
     apiKey: process.env.GEMINI_API_KEY
   }),
 })
@@ -141,7 +162,7 @@ Take a deep breath and work on this problem step-by-step.
 
   `,
   model: gemini({
-    model: "gemini-1.5-flash-8b",
+    model: "gemini-1.5-flash",
     apiKey: process.env.GEMINI_API_KEY,
   }),
 });
@@ -198,159 +219,87 @@ export const generateAgentQuestions = inngest.createFunction(
 );
 
 
-const VECTOR_SIZE = 3072; // Must match your embedding model
-
-async function ensureCollection() {
-  const collections = await qdrant.getCollections();
-  const exists = collections.collections.some(c => c.name === "agents");
-
-  // If exists, ensure size matches — if not, recreate
-  if (exists) {
-    const info = await qdrant.getCollection("agents");
-
-    // qdrant response shapes may vary between SDK versions; try common locations for vector size.
-    const currentVectorSize =
-      (info as any).vectors?.size ??
-      (info as any).config?.vectors?.size ??
-      (info as any).config?.params?.vectors?.size ??
-      null;
-
-    if (currentVectorSize === null) {
-      console.warn(
-        `⚠️ Could not determine vector size for 'agents' collection, recreating to ensure correct vector size (${VECTOR_SIZE})`
-      );
-      await qdrant.deleteCollection("agents");
-    } else if (currentVectorSize !== VECTOR_SIZE) {
-      console.warn(
-        `⚠️ Recreating 'agents' collection with correct vector size (${VECTOR_SIZE}), found ${currentVectorSize}`
-      );
-      await qdrant.deleteCollection("agents");
-    } else {
-      return; // ✅ Already correct
-    }
-  }
-
-  await qdrant.createCollection("agents", {
-    vectors: { size: VECTOR_SIZE, distance: "Cosine" },
-  });
-
-  console.log(`✅ Collection 'agents' created with vector size ${VECTOR_SIZE}`);
-}
-
-// export const generateAndStoreEmbeddings = inngest.createFunction(
-//   { id: "generate-and-store-embeddings" },
-//   { event: "agents/generate-embeddings" },
-//   async ({ event, step }) => {
-//     const { agentId, texts } = event.data;
-//     console.log("🔹 Generating embeddings for agent:", agentId);
-
-//     // Ensure collection exists with correct dimensions
-//     await ensureCollection();
-
-//     // 1️⃣ Fetch agent info
-//     const agent = await step.run("fetch-agent", async () => {
-//       const res = await db.select().from(agents).where(eq(agents.id, agentId));
-//       return res[0];
-//     });
-
-//     if (!agent) throw new Error("Agent not found");
-
-//     // 2️⃣ Generate embeddings using LangChain Gemini Embeddings
-//     const vectors = await step.run("generate-embeddings", async () => {
-//       const textArray = texts as string[];
-//       console.log(`Generating embeddings for ${textArray.length} texts`);
-//       console.log("Text Array sample:", textArray.slice(0, 2)); // Only log first 2 for brevity
-
-//       const results = await Promise.all(
-//         textArray.map(async (text, idx) => {
-//           const vector = await geminiEmbeddings.embedQuery(text);
-
-//           // Validate vector dimension
-//           if (vector.length !== VECTOR_SIZE) {
-//             throw new Error(
-//               `Vector dimension mismatch! Expected ${VECTOR_SIZE}, got ${vector.length}`
-//             );
-//           }
-
-//           console.log(`✅ Generated embedding ${idx + 1}/${textArray.length}, dimension: ${vector.length}`);
-
-//           return {
-//             // id: `${agentId}-${idx}`,
-//             id: randomUUID(),
-//             vector,
-//             payload: { 
-//               agentId, 
-//               text: text.substring(0, 1000), // Truncate text to first 1000 chars
-//               textIndex: idx 
-//             },
-//           };
-//         })
-//       );
-
-//       console.log(`✅ Generated ${results.length} embeddings`);
-//       return results;
-//     });
-
-//     // 3️⃣ Store embeddings in Qdrant
-//     const result = await step.run("store-embeddings", async () => {
-//       try {
-//         // Verify collection configuration
-//         const collectionInfo = await qdrant.getCollection("agents");
-//         const collectionVectorSize = 
-//           (collectionInfo as any).vectors?.size ??
-//           (collectionInfo as any).config?.vectors?.size ??
-//           (collectionInfo as any).config?.params?.vectors?.size;
-
-//         console.log(`📊 Collection vector size: ${collectionVectorSize}`);
-
-//         if (collectionVectorSize !== VECTOR_SIZE) {
-//           throw new Error(
-//             `Collection dimension mismatch! Collection has ${collectionVectorSize}, embeddings have ${VECTOR_SIZE}`
-//           );
-//         }
-
-//         const points = vectors.map(e => ({
-//           id: e.id,
-//           vector: e.vector,
-//           payload: e.payload,
-//         }));
-
-//         console.log(`📦 Upserting ${points.length} points to Qdrant`);
-//         console.log(`📏 First vector dimension: ${points[0].vector.length}`);
-//         console.log(`📝 Sample payload:`, points[0].payload);
-
-//         const upsertResult = await qdrant.upsert("agents", { 
-//           points, 
-//           wait: true 
-//         });
-
-//         console.log(`✅ Successfully stored ${points.length} embeddings for agent ${agentId}`);
-//         console.log(`📊 Upsert result:`, upsertResult);
-
-//         return { success: true, pointsStored: points.length };
-//       } catch (error: any) {
-//         console.error("❌ Error storing embeddings in Qdrant:");
-//         console.error("❌ Error message:", error.message);
-//         console.error("❌ Error status:", error.status);
-//         console.error("❌ Error data:", JSON.stringify(error.data, null, 2));
-//         console.error("❌ Full error:", error);
-
-//         // Re-throw to mark step as failed
-//         throw new Error(`Failed to store embeddings: ${error.message}`);
-//       }
-//     });
-
-//     return { 
-//       success: true, 
-//       pointsStored: result.pointsStored, 
-//       agentId 
-//     };
-//   }
-// );
 
 interface PageData {
   url: string;
   text: string;
+}
+
+interface ChunkResult {
+  heading: string;
+  chunk: string;
+  index: number;
+}
+
+function chunkText(
+  text: string,
+  options: { maxChars?: number; overlap?: number } = {}
+): ChunkResult[] {
+  const MAX_CHARS = options.maxChars ?? 1000;
+  const OVERLAP = options.overlap ?? 200;
+  const results: ChunkResult[] = [];
+
+  const paragraphs = text.split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
+
+  let currentHeading = "Content";
+  let buffer: string[] = [];
+  let bufferLength = 0;
+
+  function flushBuffer(heading: string) {
+    if (buffer.length === 0) return;
+    const fullText = buffer.join("\n\n");
+
+    if (fullText.length <= MAX_CHARS) {
+      results.push({ heading, chunk: fullText, index: results.length });
+    } else {
+      let start = 0;
+      while (start < fullText.length) {
+        const end = Math.min(start + MAX_CHARS, fullText.length);
+        results.push({
+          heading,
+          chunk: fullText.slice(start, end),
+          index: results.length,
+        });
+        start += MAX_CHARS - OVERLAP;
+      }
+    }
+    buffer = [];
+    bufferLength = 0;
+  }
+
+  for (const para of paragraphs) {
+    const headingMatch = para.match(/^#{1,3}\s+(.+)$/);
+    if (headingMatch) {
+      flushBuffer(currentHeading);
+      currentHeading = headingMatch[1].trim();
+      continue;
+    }
+
+    if (bufferLength + para.length > MAX_CHARS && buffer.length > 0) {
+      flushBuffer(currentHeading);
+    }
+
+    buffer.push(para);
+    bufferLength += para.length;
+  }
+
+  flushBuffer(currentHeading);
+  return results;
+}
+
+function deduplicateChunks<T extends { chunkText?: string; chunk?: string }>(
+  chunks: T[]
+): T[] {
+  const unique: T[] = [];
+  chunks.forEach(chunk => {
+    const text = chunk.chunkText ?? chunk.chunk ?? "";
+    const isDuplicate = unique.some(u => {
+      const uText = u.chunkText ?? u.chunk ?? "";
+      return stringSimilarity.compareTwoStrings(uText, text) > 0.9;
+    });
+    if (!isDuplicate) unique.push(chunk);
+  });
+  return unique;
 }
 
 export const generateAndStoreEmbeddings = inngest.createFunction(
@@ -363,7 +312,7 @@ export const generateAndStoreEmbeddings = inngest.createFunction(
     }
 
     console.log(`🔹 Generating embeddings for agent: ${agentId}`);
-    await ensureCollection();
+    await ensureAgentCollection();
 
     // 1️⃣ Fetch agent info
     const agent = await step.run("fetch-agent", async () => {
@@ -372,7 +321,7 @@ export const generateAndStoreEmbeddings = inngest.createFunction(
     });
     if (!agent) throw new Error("Agent not found");
 
-    // 2️⃣ Split pages into semantic sections and paragraph chunks
+    // 2) Split pages into semantic chunks
     const chunks: {
       url: string;
       section: string;
@@ -380,104 +329,49 @@ export const generateAndStoreEmbeddings = inngest.createFunction(
       chunkIndex: number;
     }[] = [];
 
-    const MAX_CHARS = 1000;   // max chars per chunk
-    const OVERLAP = 200;      // chars overlap between chunks
-
-    console.log(`📄 Splitting ${pages.length} pages into chunks`);
-    console.log(`📏 Max chars per chunk: ${MAX_CHARS}`);
-    console.log(`🔄 Overlap between chunks: ${OVERLAP}`);
-    console.log(`----------------------------------------`, pages);
-
     const validPages = pages.filter(p => p.text && p.text.trim().length > 0);
 
     validPages.forEach(page => {
-      const lines = page.text.split("\n").map(l => l.trim()).filter(Boolean);
-      let currentHeading = "Introduction";
-      let currentContent: string[] = [];
-
-      lines.forEach(line => {
-        if (/^#{1,3}\s/.test(line) || line.length < 100) {
-          // Treat short lines or markdown headings as heading
-          if (currentContent.length) {
-            const sectionText = currentContent.join("\n");
-            // Chunk section text with overlap
-            let start = 0, chunkIndex = 0;
-            while (start < sectionText.length) {
-              const end = Math.min(start + MAX_CHARS, sectionText.length);
-              const chunk = sectionText.slice(start, end);
-              chunks.push({
-                url: page.url,
-                section: currentHeading,
-                chunkText: chunk,
-                chunkIndex
-              });
-              chunkIndex++;
-              start += MAX_CHARS - OVERLAP;
-            }
-          }
-          currentHeading = line;
-          currentContent = [];
-        } else {
-          currentContent.push(line);
-        }
+      const pageChunks = chunkText(page.text);
+      pageChunks.forEach(c => {
+        chunks.push({
+          url: page.url,
+          section: c.heading,
+          chunkText: c.chunk,
+          chunkIndex: c.index,
+        });
       });
-
-      // Handle last section
-      if (currentContent.length) {
-        const sectionText = currentContent.join("\n");
-        let start = 0, chunkIndex = 0;
-        while (start < sectionText.length) {
-          const end = Math.min(start + MAX_CHARS, sectionText.length);
-          const chunk = sectionText.slice(start, end);
-          chunks.push({
-            url: page.url,
-            section: currentHeading,
-            chunkText: chunk,
-            chunkIndex
-          });
-          chunkIndex++;
-          start += MAX_CHARS - OVERLAP;
-        }
-      }
     });
 
-    console.log(`📄 Total chunks extracted: ${chunks.length}`);
+    console.log(`Total chunks extracted: ${chunks.length}`);
 
-    // 3️⃣ Deduplicate chunks (optional but recommended)
-    const uniqueChunks: typeof chunks = [];
-    chunks.forEach(chunk => {
-      const isDuplicate = uniqueChunks.some(u =>
-        stringSimilarity.compareTwoStrings(u.chunkText, chunk.chunkText) > 0.9
-      );
-      if (!isDuplicate) uniqueChunks.push(chunk);
-    });
-    console.log(`✅ Unique chunks after deduplication: ${uniqueChunks.length}`);
+    // 3) Deduplicate chunks
+    const uniqueChunks = deduplicateChunks(chunks);
+    console.log(`Unique chunks after deduplication: ${uniqueChunks.length}`);
 
     // 4️⃣ Generate embeddings
     const vectors = await step.run("generate-embeddings", async () => {
-      return Promise.all(
-        uniqueChunks.map(async (chunk) => {
-          const vector = await geminiEmbeddings.embedQuery(chunk.chunkText);
+      return mapWithConcurrency(uniqueChunks, EMBED_CONCURRENCY, async (chunk) => {
+        const vector = await geminiEmbeddings.embedQuery(chunk.chunkText);
 
-          if (vector.length !== VECTOR_SIZE) {
-            throw new Error(
-              `Vector dimension mismatch! Expected ${VECTOR_SIZE}, got ${vector.length}`
-            );
-          }
+        if (vector.length !== VECTOR_SIZE) {
+          throw new Error(
+            `Vector dimension mismatch! Expected ${VECTOR_SIZE}, got ${vector.length}`
+          );
+        }
 
-          return {
-            id: randomUUID(),
-            vector,
-            payload: {
-              agentId,
-              url: chunk.url,
-              section: chunk.section,
-              text: chunk.chunkText,
-              chunkIndex: chunk.chunkIndex
-            }
-          };
-        })
-      );
+        return {
+          id: randomUUID(),
+          vector,
+          payload: {
+            agentId,
+            url: chunk.url,
+            section: chunk.section,
+            text: chunk.chunkText,
+            chunkIndex: chunk.chunkIndex,
+          },
+        };
+      });
     });
 
     console.log(`📊 Generated ${vectors.length} embeddings`);
@@ -505,23 +399,22 @@ export const generateAndStoreEmbeddings = inngest.createFunction(
 export const instructionOnlyAgent = createAgent({
   name: "instruction-only-agent",
   system: `
-You are an assistant whose knowledge is ONLY the "INSTRUCTIONS" block provided below.
-You MUST answer user questions using solely the information inside INSTRUCTIONS.
-Do NOT access external knowledge, do not guess, do not hallucinate, and do not answer with anything outside INSTRUCTIONS.
-If a question cannot be answered using the INSTRUCTIONS exactly, reply only with:
+You are an assistant whose knowledge comes from INSTRUCTIONS and CONTEXT blocks provided below.
+CONTEXT contains relevant excerpts retrieved from the agent's knowledge base (documents, web pages).
+You MUST answer user questions using solely the information inside INSTRUCTIONS and CONTEXT.
+Do NOT access external knowledge, do not guess, do not hallucinate.
+If a question cannot be answered using the provided information, reply only with:
 "I don't know based on the given information."
 
 Strict output rules:
 - Answer concisely and directly.
-- If the answer exists in the INSTRUCTIONS, provide it (full sentences are fine).
-- If it does not, use exactly: "I don't know based on the given information."
+- If the answer exists in the INSTRUCTIONS or CONTEXT, provide it.
+- When citing from CONTEXT, mention the source if available.
+- If neither contains the answer, use exactly: "I don't know based on the given information."
 - Do not include extra commentary, meta explanation, or questions back to the user.
-
-INSTRUCTIONS:
-{{INSTRUCTIONS_PLACEHOLDER}}
 `.trim(),
   model: gemini({
-    model: "gemini-1.5-flash-8b",
+    model: "gemini-1.5-flash",
     apiKey: process.env.GEMINI_API_KEY,
   }),
 });
@@ -531,10 +424,11 @@ export const agentChatHandler = inngest.createFunction(
   { event: "agent/message" },
   async ({ event, step }) => {
     const { agentId, conversationId, userId, content } = event.data;
-    console.log("🚀 agentChatHandler fired for agent:", agentId);
+    console.log("agentChatHandler fired for agent:", agentId);
 
     // 1) Fetch agent record
     const agent = await step.run("fetch-agent", async () => {
+      await ensureAgentCollection();
       const res = await db.select().from(agents).where(eq(agents.id, agentId));
       return res[0];
     });
@@ -542,40 +436,177 @@ export const agentChatHandler = inngest.createFunction(
     if (!agent) throw new Error("Agent not found");
 
     const instructionsText = agent.instructions ?? "";
-    console.log("Agent instructions fetched, length:", instructionsText);
 
-    // 2) Build prompt
+    // 2) RAG retrieval: embed user question and search Qdrant
+    const ragContext = await step.run("rag-retrieval", async () => {
+      try {
+        const queryVector = await geminiEmbeddings.embedQuery(content);
+
+        const searchResults = await qdrant.search("agents", {
+          vector: queryVector,
+          limit: 5,
+          filter: {
+            must: [
+              { key: "agentId", match: { value: agentId } },
+            ],
+          },
+          score_threshold: 0.5,
+        });
+
+        if (searchResults.length === 0) return "";
+
+        const contextParts = searchResults.map((result, i) => {
+          const payload = result.payload as {
+            text: string;
+            url?: string;
+            section?: string;
+            fileName?: string;
+          };
+          const source = payload.url || payload.fileName || "knowledge base";
+          return `[Source ${i + 1}: ${source}${payload.section ? ` - ${payload.section}` : ""}]\n${payload.text}`;
+        });
+
+        return contextParts.join("\n\n---\n\n");
+      } catch (error) {
+        console.error("RAG retrieval failed, falling back to instructions only:", error);
+        return "";
+      }
+    });
+
+    // 3) Build prompt with RAG context
     const prompt = `
-You are an assistant whose knowledge is ONLY the provided instructions.
-If the user asks anything not covered, respond exactly with:
+You are an assistant whose knowledge comes from the provided INSTRUCTIONS and CONTEXT.
+Use the CONTEXT (retrieved from the knowledge base) to answer the user's question when relevant.
+If the answer is found in either INSTRUCTIONS or CONTEXT, provide it.
+If neither contains the answer, respond exactly with:
 "I don't know based on the given information."
 
 INSTRUCTIONS:
 ${instructionsText}
 
+${ragContext ? `CONTEXT (from knowledge base):\n${ragContext}` : ""}
+
 USER QUESTION:
 ${content}
 `.trim();
 
-
-    // ✅ DO NOT wrap this in step.run — avoids nested steps
+    // DO NOT wrap this in step.run to avoid nested steps
     const { output } = await instructionOnlyAgent.run(prompt);
-    console.log("Agent response generated.", output);
-
     const reply = (output[0] as TextMessage).content as string;
-    console.log("Agent reply generated:", reply);
 
-    // 3) Save reply — safe to use step.run here
+    // 4) Save reply
+    // ponytail: messages.userId FKs to user.id, so agent replies borrow the
+    // conversation owner's userId. `sender` distinguishes the actual author.
+    // Upgrade path: make messages.userId nullable if we ever need "system" msgs.
     await step.run("save-agent-reply", async () => {
       await db.insert(messages).values({
         conversationId,
-        userId: agent.id, // agent is the speaker
+        userId,
         sender: "agent",
         content: reply,
       });
     });
 
     return { success: true, reply };
+  }
+);
+
+export const processDocumentEmbeddings = inngest.createFunction(
+  { id: "process-document-embeddings" },
+  { event: "documents/process" },
+  async ({ event, step }) => {
+    const { documentId, agentId, fileUrl, fileName, mimeType } = event.data;
+
+    console.log(`Processing document: ${fileName} for agent: ${agentId}`);
+    await ensureAgentCollection();
+
+    // 1) Update status to processing
+    await step.run("mark-processing", async () => {
+      await db
+        .update(documents)
+        .set({ status: "processing", updatedAt: new Date() })
+        .where(eq(documents.id, documentId));
+    });
+
+    // 2) Download and parse the document in a single step
+    //    (Buffer cannot be serialized across Inngest steps)
+    const parsedText = await step.run("download-and-parse", async () => {
+      const response = await fetch(fileUrl);
+      const arrayBuffer = await response.arrayBuffer();
+      const fileBuffer = Buffer.from(arrayBuffer);
+
+      const { parseDocument } = await import("@/utils/document-parser");
+      const parsed = await parseDocument(fileBuffer, fileName, mimeType);
+      return parsed.text;
+    });
+
+    if (!parsedText || parsedText.trim().length === 0) {
+      await step.run("mark-failed", async () => {
+        await db
+          .update(documents)
+          .set({ status: "failed", error: "No text content extracted", updatedAt: new Date() })
+          .where(eq(documents.id, documentId));
+      });
+      return { success: false, reason: "No text extracted" };
+    }
+
+    // 4) Chunk the text
+    const chunks = chunkText(parsedText);
+    console.log(`Extracted ${chunks.length} chunks from ${fileName}`);
+
+    // 5) Generate embeddings
+    const vectors = await step.run("generate-embeddings", async () => {
+      return mapWithConcurrency(chunks, EMBED_CONCURRENCY, async (chunk) => {
+        const vector = await geminiEmbeddings.embedQuery(chunk.chunk);
+
+        if (vector.length !== VECTOR_SIZE) {
+          throw new Error(
+            `Vector dimension mismatch! Expected ${VECTOR_SIZE}, got ${vector.length}`
+          );
+        }
+
+        return {
+          id: randomUUID(),
+          vector,
+          payload: {
+            agentId,
+            documentId,
+            fileName,
+            source: fileName,
+            section: chunk.heading,
+            text: chunk.chunk,
+            chunkIndex: chunk.index,
+          },
+        };
+      });
+    });
+
+    // 6) Store in Qdrant
+    await step.run("store-embeddings", async () => {
+      await qdrant.upsert("agents", {
+        points: vectors.map(v => ({
+          id: v.id,
+          vector: v.vector,
+          payload: v.payload,
+        })),
+        wait: true,
+      });
+    });
+
+    // 7) Update document status
+    await step.run("mark-completed", async () => {
+      await db
+        .update(documents)
+        .set({
+          status: "completed",
+          chunkCount: vectors.length,
+          updatedAt: new Date(),
+        })
+        .where(eq(documents.id, documentId));
+    });
+
+    console.log(`Successfully processed ${fileName}: ${vectors.length} chunks stored`);
+    return { success: true, chunksProcessed: vectors.length };
   }
 );
 

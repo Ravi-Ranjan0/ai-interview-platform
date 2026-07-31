@@ -1,6 +1,7 @@
+"use client";
+
 import { useTRPC } from "@/trpc/clients";
 import { AgentGetOne } from "../../type";
-// import { useRouter } from "next/navigation";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
 import { agentsInsertSchema } from "../../schema";
@@ -18,11 +19,28 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
+import { useState } from "react";
+import { useUploadThing } from "@/lib/uploadthing-client";
+import { Loader2Icon } from "lucide-react";
 
 interface AgentFormProps {
   onSuccess?: () => void;
   onCancel?: () => void;
   initialValues?: AgentGetOne;
+}
+
+function getMimeType(fileName: string): string {
+  const ext = fileName.split(".").pop()?.toLowerCase();
+  switch (ext) {
+    case "pdf":
+      return "application/pdf";
+    case "docx":
+      return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    case "txt":
+      return "text/plain";
+    default:
+      return "application/octet-stream";
+  }
 }
 
 export const AgentForm = ({
@@ -31,27 +49,54 @@ export const AgentForm = ({
   initialValues,
 }: AgentFormProps) => {
   const trpc = useTRPC();
-  //   const router = useRouter();
   const queryClient = useQueryClient();
+  const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  const [isUploadingFiles, setIsUploadingFiles] = useState(false);
+
+  const { startUpload } = useUploadThing("documentUploader");
+
+  const createDocument = useMutation(
+    trpc.documents.create.mutationOptions({})
+  );
 
   const createAgent = useMutation(
     trpc.agents.create.mutationOptions({
-      onSuccess: async () => {
+      onSuccess: async (createdAgent) => {
         await queryClient.invalidateQueries(
           trpc.agents.getMany.queryOptions({})
         );
 
-        if (initialValues?.id) {
-          await queryClient.invalidateQueries(
-            trpc.agents.getOne.queryOptions({ id: initialValues.id })
-          );
+        // Upload pending files after agent creation
+        if (pendingFiles.length > 0) {
+          setIsUploadingFiles(true);
+          try {
+            const uploaded = await startUpload(pendingFiles);
+            if (uploaded) {
+              for (const file of uploaded) {
+                await createDocument.mutateAsync({
+                  agentId: createdAgent.id,
+                  fileName: file.name,
+                  fileUrl: file.url,
+                  fileSize: file.size,
+                  mimeType: getMimeType(file.name),
+                });
+              }
+              toast.success(
+                `${uploaded.length} document(s) uploaded and queued for processing`
+              );
+            }
+          } catch (error) {
+            toast.error("Failed to upload documents. You can upload them later from the Knowledge Base tab.");
+          } finally {
+            setIsUploadingFiles(false);
+            setPendingFiles([]);
+          }
         }
+
         onSuccess?.();
       },
       onError: (error) => {
         toast.error(error.message);
-
-        //TODO :Check if error code is "FORBIDDEN," redirect to "/upgrade"
       },
     })
   );
@@ -66,8 +111,6 @@ export const AgentForm = ({
       },
       onError: (error) => {
         toast.error(error.message);
-
-        //TODO :Check if error code is "FORBIDDEN," redirect to "/upgrade"
       },
     })
   );
@@ -90,23 +133,14 @@ export const AgentForm = ({
   });
 
   const isEdit = !!initialValues?.id;
-  const isPending = createAgent.isPending || updateAgent.isPending;
+  const isPending =
+    createAgent.isPending || updateAgent.isPending || isUploadingFiles;
 
   const onSubmit = (values: z.infer<typeof agentsInsertSchema>) => {
-    console.log("Form submitted with values:", values);
-    const formData = new FormData();
-    formData.append("name", values.name);
-    formData.append("instructions", values.instructions);
-    // if (values.pdf) {
-    //   formData.append("pdf", values.pdf);
-    // }
     if (isEdit) {
-      // Handle update logic here
       updateAgent.mutate({ ...values, id: initialValues.id });
-      console.log("Update agent:", values);
     } else {
       createAgent.mutate(values);
-      // createAgent.mutate(formData);
     }
   };
 
@@ -143,25 +177,6 @@ export const AgentForm = ({
               </FormItem>
             )}
           />
-          {/* <FormField
-            name="pdf"
-            control={form.control}
-            render={({ field }) => (
-              <FormItem>
-                <FormLabel>Upload PDF (optional)</FormLabel>
-                <FormControl>
-                  <Input
-                    type="file"
-                    accept="application/pdf"
-                    onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      field.onChange(file);
-                    }}
-                  />
-                </FormControl>
-              </FormItem>
-            )}
-          /> */}
           <FormField
             name="urls"
             control={form.control}
@@ -183,6 +198,32 @@ export const AgentForm = ({
               </FormItem>
             )}
           />
+          {!isEdit && (
+            <FormItem>
+              <FormLabel>Upload Documents (optional)</FormLabel>
+              <FormControl>
+                <Input
+                  type="file"
+                  accept=".pdf,.docx,.txt,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain"
+                  multiple
+                  onChange={(e) => {
+                    const files = Array.from(e.target.files ?? []);
+                    setPendingFiles(files);
+                  }}
+                />
+              </FormControl>
+              <p className="text-xs text-muted-foreground">
+                Supported: PDF, DOCX, TXT (max 16MB each). You can also upload
+                more files later from the Knowledge Base tab.
+              </p>
+              {pendingFiles.length > 0 && (
+                <p className="text-xs text-blue-600">
+                  {pendingFiles.length} file(s) selected - will be uploaded
+                  after agent creation
+                </p>
+              )}
+            </FormItem>
+          )}
           <div className="flex justify-around gap-x-2">
             {onCancel && (
               <Button
@@ -195,6 +236,9 @@ export const AgentForm = ({
               </Button>
             )}
             <Button type="submit" disabled={isPending}>
+              {isPending && (
+                <Loader2Icon className="size-4 animate-spin mr-2" />
+              )}
               {isEdit ? "Update" : "Create"}
             </Button>
           </div>

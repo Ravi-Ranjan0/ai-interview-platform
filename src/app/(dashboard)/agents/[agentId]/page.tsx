@@ -21,6 +21,11 @@ const Page = async ({ params }: Props) => {
       id: agentId,
     })
   );
+  void queryClient.prefetchQuery(
+    trpc.documents.getByAgent.queryOptions({
+      agentId,
+    })
+  );
   return (
     <HydrationBoundary state={dehydrate(queryClient)}>
       <Suspense fallback={<AgentIdViewLoading />}>

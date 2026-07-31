@@ -1,4 +1,4 @@
-import { pgTable, text, timestamp, boolean, integer, pgEnum } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, boolean, integer, pgEnum, AnyPgColumn } from "drizzle-orm/pg-core";
 import { nanoid } from "nanoid";
 
 export const user = pgTable("user", {
@@ -94,4 +94,26 @@ export const messages = pgTable("messages", {
   sender: text('sender').notNull(), // 'user' or 'agent'
   content: text('content').notNull(),
   createdAt: timestamp('created_at').notNull().defaultNow(),
+});
+
+export const documentStatus = pgEnum("document_status", [
+  "pending",
+  "processing",
+  "completed",
+  "failed",
+]);
+
+export const documents = pgTable("documents", {
+  id: text('id').primaryKey().$defaultFn(() => nanoid()),
+  agentId: text('agent_id').notNull().references(() => agents.id, { onDelete: 'cascade' }),
+  userId: text('user_id').notNull().references(() => user.id, { onDelete: 'cascade' }),
+  fileName: text('file_name').notNull(),
+  fileUrl: text('file_url').notNull(),
+  fileSize: integer('file_size'),
+  mimeType: text('mime_type').notNull(),
+  status: documentStatus('status').notNull().default("pending"),
+  chunkCount: integer('chunk_count'),
+  error: text('error'),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+  updatedAt: timestamp('updated_at').notNull().defaultNow(),
 });
