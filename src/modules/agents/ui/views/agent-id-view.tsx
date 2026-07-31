@@ -83,7 +83,7 @@ export const AgentIdView = ({ agentId }: Props) => {
           <TabsList>
             <TabsTrigger value="details">Details</TabsTrigger>
             <TabsTrigger value="knowledge">Knowledge Base</TabsTrigger>
-            <TabsTrigger value="test">Test</TabsTrigger>
+            <TabsTrigger value="test">Chat</TabsTrigger>
           </TabsList>
           <TabsContent value="details">
             <div className="bg-white rounded-lg border">
@@ -126,7 +126,7 @@ export const AgentIdView = ({ agentId }: Props) => {
             </div>
           </TabsContent>
           <TabsContent value="test">
-            <TestAgent agentId={agentId} />
+            <TestAgent agentId={agentId} agentName={data.name} />
           </TabsContent>
         </Tabs>
       </div>

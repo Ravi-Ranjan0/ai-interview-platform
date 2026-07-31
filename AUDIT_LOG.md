@@ -1,5 +1,102 @@
 # Audit Log
 
+## Feature — Chat UX polish (formerly B7 debug tool) — 2026-08-01
+### Spec
+Redesigned the existing `TestAgent` component from a debug-shaped panel
+into a real "chat with your documents" experience. Owner-only, same
+retrieval/backend, same tab location. Server code untouched.
+
+Concrete before → after:
+- Tab renamed **Test → Chat**.
+- Header uses the agent's avatar + name ("Chat with {agentName}") instead
+  of generic debug copy.
+- Empty state is a centered greeting keyed to agent name, not a debug
+  hint line.
+- User bubbles: raw `bg-blue-500` → semantic `bg-primary text-primary-
+  foreground` with `rounded-2xl` and asymmetric bottom-right (`rounded-br-sm`).
+- Agent bubbles: raw `bg-gray-100` → semantic `bg-muted`, with the agent's
+  avatar next to the bubble, asymmetric bottom-left.
+- Agent reply content: plain text → rendered via `react-markdown` (already
+  installed; same components map as `meetings/completed-state.tsx` so the
+  language matches the rest of the app).
+- Sources: raw bullet list exposing scores → collapsed "Show N sources"
+  toggle → citation chips as `Badge`s with file/link icon and truncated label.
+  Scores no longer surfaced (debug detail, not user info).
+- Loading (waiting for reply): spinner + "Agent is thinking…" → three-dot
+  pulsing typing indicator inside a muted bubble, left-aligned with avatar
+  — recognizable metaphor.
+- Input: single-line `<Input>` → auto-growing `<textarea>` (max 160px),
+  `Enter` sends, `Shift+Enter` newline, keyboard hint line beneath.
+- Send button: rounded pill → circular icon button inside a bordered pill
+  containing the textarea (composed input group).
+- Entry animation: new messages fade + slide in via `tw-animate-css`
+  utilities (already imported globally).
+
+Explicit owner-vs-candidate decision: **owner-only stays**. Candidate
+access requires a different authz model (shared-link tokens, no
+`assertAgentOwned`); scope separately if wanted.
+
+### Built this cycle
+- `src/modules/agents/ui/components/test-agent.tsx` — full component
+  rewrite. Now takes an `agentName` prop; renders greeting/header/typing/
+  bubbles with semantic tokens; markdown-renders agent replies; sources
+  collapsed with per-message toggle; auto-growing textarea; keyboard hints.
+- `src/modules/agents/ui/views/agent-id-view.tsx` — tab label
+  `Test` → `Chat`; passes `agentName={data.name}` into `<TestAgent>`.
+
+### Verification
+- **Compiled**: tsc 0 errors; `npm run build` green.
+- **Functionally exercised**: NOT this session. This is a visual redesign;
+  a green build says nothing about whether it looks right. Live-env
+  checklist:
+    1. Open an agent detail page → Chat tab.
+    2. Confirm greeting empty state renders with agent name + sparkles icon.
+    3. Send a message — confirm user bubble appears immediately, right-
+       aligned, in primary color; three-dot typing indicator appears below.
+    4. Wait for reply — confirm agent bubble replaces the indicator,
+       left-aligned with the agent avatar; if the reply uses **bold** or
+       `- lists`, confirm markdown renders.
+    5. Confirm a "Show N sources" toggle appears under the reply (assuming
+       the agent has any docs/URLs indexed); click it and confirm chip
+       badges render with a file/link icon and readable label.
+    6. Try Enter (sends), Shift+Enter (newline in textarea), and confirm
+       the textarea auto-grows up to ~6 rows, then scrolls.
+    7. Confirm no console errors and no layout shifts on the surrounding
+       tabs (Details, Knowledge Base).
+
+### Deferred (explicitly out of scope this increment)
+- **Streaming token-by-token responses.** Still polling at 1.5s. Would
+  require server-side changes (SSE or WS from Inngest) — much larger
+  scope, separate feature.
+- **Candidate-facing access.** Different authz model (shared-link tokens,
+  no `assertAgentOwned`). Scope separately.
+- **Dedicated full-page `/agents/[id]/chat` route.** The tabbed context
+  proved fine visually; a full-page route is a structural change to defer
+  until there's evidence the tabbed panel isn't enough.
+- **Suggested starter questions.** Would need a new procedure and probably
+  an LLM call per agent; nice-to-have.
+- **Backend / retrieval changes.** Untouched by intent.
+- **Item 4 (embedding.ts native rewrite)** and **Item 13 (avatar
+  consolidation)** from cycle 2.5 still deferred pending live-env
+  verification.
+
+### Notes
+- Markdown components map is duplicated between
+  `meetings/completed-state.tsx` and `test-agent.tsx`. If a third markdown-
+  rendering site appears, promote to a shared `<AgentMarkdown>` component.
+  Two call sites don't yet justify the extraction — YAGNI.
+- The `messages.metadata` column (added for B7 in the previous cycle) is
+  now consumed by two paths: the polling loop that reads it into the
+  chat's Sources chip row, and any future debug panel. Its JSON shape
+  (`{ sources: [{fileName?, url?, section?, score?}] }`) is a small ad-hoc
+  contract worth codifying as a shared TS type if a third reader shows up.
+- The `showSourcesFor` state is per-index. If messages ever get real
+  stable ids on the client (they don't today — `getMessages` returns
+  indexed rows), key sources open-state on message id instead of index
+  to survive reorders/pagination.
+
+---
+
 ## Feature — B6 URL re-crawl — 2026-08-01
 ### Spec
 New "Crawled URLs" panel on the agent detail page (under Knowledge Base)

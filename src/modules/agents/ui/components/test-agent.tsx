@@ -1,12 +1,21 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  KeyboardEvent,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useTRPC } from "@/trpc/clients";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { Loader2Icon, Send, FileIcon } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+import { Loader2Icon, SendHorizonalIcon, FileIcon, LinkIcon, SparklesIcon } from "lucide-react";
 import { toast } from "sonner";
+import Markdown from "react-markdown";
+import { GeneratedAvatar } from "@/components/generated-avatar";
+import { cn } from "@/lib/utils";
 
 type Source = {
   fileName?: string;
@@ -25,15 +34,69 @@ function parseSources(metadata: string | null | undefined): Source[] {
   }
 }
 
-interface Props {
-  agentId: string;
+function sourceLabel(s: Source): string {
+  if (s.fileName) return s.fileName;
+  if (s.url) {
+    try {
+      return new URL(s.url).hostname.replace(/^www\./, "");
+    } catch {
+      return s.url;
+    }
+  }
+  return "knowledge base";
 }
 
-export const TestAgent = ({ agentId }: Props) => {
+const MARKDOWN_COMPONENTS = {
+  h1: (props: React.HTMLAttributes<HTMLHeadingElement>) => (
+    <h1 className="text-lg font-semibold mt-2 mb-2" {...props} />
+  ),
+  h2: (props: React.HTMLAttributes<HTMLHeadingElement>) => (
+    <h2 className="text-base font-semibold mt-2 mb-2" {...props} />
+  ),
+  h3: (props: React.HTMLAttributes<HTMLHeadingElement>) => (
+    <h3 className="text-sm font-semibold mt-2 mb-1" {...props} />
+  ),
+  p: (props: React.HTMLAttributes<HTMLParagraphElement>) => (
+    <p className="leading-relaxed [&:not(:last-child)]:mb-2" {...props} />
+  ),
+  ul: (props: React.HTMLAttributes<HTMLUListElement>) => (
+    <ul className="list-disc list-inside space-y-1 [&:not(:last-child)]:mb-2" {...props} />
+  ),
+  ol: (props: React.HTMLAttributes<HTMLOListElement>) => (
+    <ol className="list-decimal list-inside space-y-1 [&:not(:last-child)]:mb-2" {...props} />
+  ),
+  li: (props: React.HTMLAttributes<HTMLLIElement>) => (
+    <li className="leading-relaxed" {...props} />
+  ),
+  strong: (props: React.HTMLAttributes<HTMLElement>) => (
+    <strong className="font-semibold" {...props} />
+  ),
+  code: (props: React.HTMLAttributes<HTMLElement>) => (
+    <code className="bg-muted-foreground/10 px-1.5 py-0.5 rounded text-[0.85em] font-mono" {...props} />
+  ),
+  pre: (props: React.HTMLAttributes<HTMLPreElement>) => (
+    <pre className="bg-muted-foreground/10 p-3 rounded-md overflow-x-auto text-[0.85em] font-mono [&:not(:last-child)]:mb-2" {...props} />
+  ),
+  blockquote: (props: React.HTMLAttributes<HTMLQuoteElement>) => (
+    <blockquote className="border-l-2 border-muted-foreground/40 pl-3 italic my-2" {...props} />
+  ),
+  a: (props: React.AnchorHTMLAttributes<HTMLAnchorElement>) => (
+    <a className="underline underline-offset-2 hover:text-primary" target="_blank" rel="noreferrer" {...props} />
+  ),
+};
+
+interface Props {
+  agentId: string;
+  agentName: string;
+}
+
+export const TestAgent = ({ agentId, agentName }: Props) => {
   const trpc = useTRPC();
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [input, setInput] = useState("");
+  const [showSourcesFor, setShowSourcesFor] = useState<number | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const getOrCreate = useMutation(
     trpc.conversations.getOrCreateTest.mutationOptions({
@@ -53,8 +116,7 @@ export const TestAgent = ({ agentId }: Props) => {
   );
   const { data: messages, refetch } = useQuery({
     ...messagesQuery,
-    // ponytail: poll only while waiting on the agent's reply (i.e. last msg is
-    // ours). Upgrade path: subscribe via WS or event stream when we add one.
+    // Poll while waiting on the agent (last message is user's).
     refetchInterval: (q) => {
       const rows = q.state.data;
       if (!rows || rows.length === 0) return false;
@@ -72,9 +134,23 @@ export const TestAgent = ({ agentId }: Props) => {
 
   const handleSend = async () => {
     const content = input.trim();
-    if (!content || !conversationId) return;
+    if (!content || !conversationId || sendMessage.isPending) return;
     setInput("");
+    // Reset textarea height after send
+    if (textareaRef.current) textareaRef.current.style.height = "auto";
     await sendMessage.mutateAsync({ conversationId, content });
+  };
+
+  const handleKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+
+  const autoResize = (el: HTMLTextAreaElement) => {
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
   };
 
   useEffect(() => {
@@ -87,93 +163,180 @@ export const TestAgent = ({ agentId }: Props) => {
     return rows[rows.length - 1].sender === "user";
   }, [rows]);
 
+  const canSend = !!conversationId && !!input.trim() && !sendMessage.isPending;
+
   return (
-    <div className="bg-white rounded-lg border flex flex-col h-[500px]">
-      <div className="px-4 py-3 border-b">
-        <p className="text-sm font-medium">Test this agent</p>
-        <p className="text-xs text-muted-foreground">
-          Send a message to exercise the RAG pipeline. Retrieved sources appear
-          under each reply.
-        </p>
+    <div className="bg-card rounded-lg border flex flex-col h-[600px] overflow-hidden">
+      {/* Header */}
+      <div className="flex items-center gap-x-3 px-4 py-3 border-b">
+        <GeneratedAvatar
+          variant="bottsNeutral"
+          seed={agentName}
+          className="size-8"
+        />
+        <div className="flex flex-col min-w-0">
+          <p className="text-sm font-medium truncate">Chat with {agentName}</p>
+          <p className="text-xs text-muted-foreground">
+            Ask a question — this agent answers from its uploaded documents and crawled URLs.
+          </p>
+        </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-4 space-y-3">
+      {/* Messages */}
+      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4">
         {!conversationId && (
-          <div className="flex items-center justify-center py-8">
+          <div className="flex items-center justify-center py-12">
             <Loader2Icon className="size-4 animate-spin text-muted-foreground" />
           </div>
         )}
+
         {conversationId && rows.length === 0 && (
-          <p className="text-sm text-muted-foreground text-center py-8">
-            No messages yet. Ask the agent something to see what it retrieves.
-          </p>
+          <div className="flex flex-col items-center justify-center py-12 text-center gap-y-3">
+            <div className="size-12 rounded-full bg-primary/10 flex items-center justify-center">
+              <SparklesIcon className="size-6 text-primary" />
+            </div>
+            <div className="flex flex-col gap-y-1 max-w-sm">
+              <p className="text-sm font-medium">Chat with {agentName}</p>
+              <p className="text-xs text-muted-foreground">
+                Ask something — this agent answers from the documents you've uploaded and the URLs you've crawled.
+              </p>
+            </div>
+          </div>
         )}
+
         {rows.map((m, i) => {
-          const sources = m.sender === "agent" ? parseSources(m.metadata) : [];
+          const isUser = m.sender === "user";
+          const sources = !isUser ? parseSources(m.metadata) : [];
+          const sourcesOpen = showSourcesFor === i;
+
           return (
             <div
               key={i}
-              className={`flex flex-col ${m.fromSelf ? "items-end" : "items-start"}`}
-            >
-              <div
-                className={`max-w-[85%] px-3 py-2 rounded-lg text-sm whitespace-pre-wrap ${
-                  m.fromSelf
-                    ? "bg-blue-500 text-white"
-                    : "bg-gray-100 text-gray-900"
-                }`}
-              >
-                {m.message}
-              </div>
-              {sources.length > 0 && (
-                <div className="max-w-[85%] mt-1 text-xs text-muted-foreground">
-                  <p className="mb-1">
-                    Retrieved {sources.length} source{sources.length === 1 ? "" : "s"}:
-                  </p>
-                  <ul className="flex flex-col gap-y-1">
-                    {sources.map((s, si) => (
-                      <li key={si} className="flex items-center gap-x-1">
-                        <FileIcon className="size-3 shrink-0" />
-                        <span className="truncate">
-                          {s.fileName ?? s.url ?? "knowledge base"}
-                          {s.section ? ` · ${s.section}` : ""}
-                          {typeof s.score === "number"
-                            ? ` (${s.score.toFixed(2)})`
-                            : ""}
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
+              className={cn(
+                "flex gap-x-2 animate-in fade-in slide-in-from-bottom-1 duration-200",
+                isUser ? "justify-end" : "justify-start"
               )}
+            >
+              {!isUser && (
+                <GeneratedAvatar
+                  variant="bottsNeutral"
+                  seed={agentName}
+                  className="size-7 mt-0.5 shrink-0"
+                />
+              )}
+              <div
+                className={cn(
+                  "flex flex-col gap-y-1.5 max-w-[85%]",
+                  isUser ? "items-end" : "items-start"
+                )}
+              >
+                <div
+                  className={cn(
+                    "px-3.5 py-2 rounded-2xl text-sm whitespace-pre-wrap",
+                    isUser
+                      ? "bg-primary text-primary-foreground rounded-br-sm"
+                      : "bg-muted text-foreground rounded-bl-sm"
+                  )}
+                >
+                  {isUser ? (
+                    m.message
+                  ) : (
+                    <div className="[&_p:first-child]:mt-0 [&_p:last-child]:mb-0">
+                      <Markdown components={MARKDOWN_COMPONENTS}>
+                        {m.message}
+                      </Markdown>
+                    </div>
+                  )}
+                </div>
+
+                {sources.length > 0 && (
+                  <div className="flex flex-col gap-y-1.5 max-w-full">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setShowSourcesFor(sourcesOpen ? null : i)
+                      }
+                      className="text-xs text-muted-foreground hover:text-foreground inline-flex items-center gap-x-1 self-start"
+                    >
+                      <span>
+                        {sourcesOpen ? "Hide" : "Show"} {sources.length} source
+                        {sources.length === 1 ? "" : "s"}
+                      </span>
+                    </button>
+                    {sourcesOpen && (
+                      <div className="flex flex-wrap gap-1.5">
+                        {sources.map((s, si) => {
+                          const Icon = s.url ? LinkIcon : FileIcon;
+                          return (
+                            <Badge
+                              key={si}
+                              variant="outline"
+                              className="gap-x-1 font-normal max-w-full"
+                            >
+                              <Icon className="size-3 shrink-0" />
+                              <span className="truncate">
+                                {sourceLabel(s)}
+                                {s.section ? ` · ${s.section}` : ""}
+                              </span>
+                            </Badge>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
             </div>
           );
         })}
+
         {waitingForReply && (
-          <div className="flex items-center gap-x-2 text-xs text-muted-foreground">
-            <Loader2Icon className="size-3 animate-spin" />
-            Agent is thinking…
+          <div className="flex gap-x-2 animate-in fade-in duration-200">
+            <GeneratedAvatar
+              variant="bottsNeutral"
+              seed={agentName}
+              className="size-7 mt-0.5 shrink-0"
+            />
+            <div className="px-4 py-3 rounded-2xl rounded-bl-sm bg-muted flex items-center gap-x-1">
+              <span className="size-1.5 rounded-full bg-muted-foreground/60 animate-bounce [animation-delay:-0.3s]" />
+              <span className="size-1.5 rounded-full bg-muted-foreground/60 animate-bounce [animation-delay:-0.15s]" />
+              <span className="size-1.5 rounded-full bg-muted-foreground/60 animate-bounce" />
+            </div>
           </div>
         )}
+
         <div ref={bottomRef} />
       </div>
 
-      <div className="flex items-center gap-2 border-t p-3">
-        <Input
-          placeholder="Ask the agent about the uploaded documents…"
-          value={input}
-          disabled={!conversationId || sendMessage.isPending}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") handleSend();
-          }}
-        />
-        <Button
-          type="button"
-          disabled={!conversationId || !input.trim() || sendMessage.isPending}
-          onClick={handleSend}
-        >
-          <Send className="size-4" />
-        </Button>
+      {/* Input */}
+      <div className="border-t p-3">
+        <div className="flex items-end gap-x-2 rounded-2xl border bg-background px-3 py-2 focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-0">
+          <textarea
+            ref={textareaRef}
+            rows={1}
+            placeholder={`Ask ${agentName} anything…`}
+            value={input}
+            disabled={!conversationId || sendMessage.isPending}
+            onChange={(e) => {
+              setInput(e.target.value);
+              autoResize(e.currentTarget);
+            }}
+            onKeyDown={handleKey}
+            className="flex-1 resize-none bg-transparent text-sm outline-none placeholder:text-muted-foreground disabled:opacity-50 max-h-40"
+          />
+          <Button
+            type="button"
+            size="icon"
+            disabled={!canSend}
+            onClick={handleSend}
+            className="shrink-0 size-8 rounded-full"
+          >
+            <SendHorizonalIcon className="size-4" />
+          </Button>
+        </div>
+        <p className="mt-1.5 text-[10px] text-muted-foreground px-1">
+          Enter to send · Shift+Enter for a new line
+        </p>
       </div>
     </div>
   );
