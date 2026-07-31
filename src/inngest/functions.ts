@@ -219,24 +219,13 @@ export const generateAgentQuestions = inngest.createFunction(
 
 
 
-interface PageData {
-  url: string;
-  text: string;
-}
-
-interface ChunkResult {
-  heading: string;
-  chunk: string;
-  index: number;
-}
-
 function chunkText(
   text: string,
   options: { maxChars?: number; overlap?: number } = {}
-): ChunkResult[] {
+) {
   const MAX_CHARS = options.maxChars ?? 1000;
   const OVERLAP = options.overlap ?? 200;
-  const results: ChunkResult[] = [];
+  const results: { heading: string; chunk: string; index: number }[] = [];
 
   const paragraphs = text.split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
 
@@ -305,7 +294,7 @@ export const generateAndStoreEmbeddings = inngest.createFunction(
   { id: "generate-and-store-embeddings" },
   { event: "agents/generate-embeddings" },
   async ({ event, step }) => {
-    const { agentId, pages } = event.data as { agentId: string; pages: PageData[] };
+    const { agentId, pages } = event.data as { agentId: string; pages: { url: string; text: string }[] };
     if (!pages || pages.length === 0) {
       throw new Error("No pages provided for embeddings generation");
     }

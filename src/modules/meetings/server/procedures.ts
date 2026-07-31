@@ -9,6 +9,7 @@ import { meetingsInsertSchema, meetingsUpdateSchema } from "../schema";
 import { MeetingStatus } from "../type";
 import { streamVideo } from "@/lib/stream-video";
 import { generateAvatarUri } from "@/lib/avatar";
+import { assertAgentOwned } from "@/lib/authz";
 
 
 export const meetingsRouter = createTRPCRouter({
@@ -103,6 +104,8 @@ export const meetingsRouter = createTRPCRouter({
 
     create: protectedProcedure.input(meetingsInsertSchema)
         .mutation(async ({ input, ctx }) => {
+            await assertAgentOwned(input.agentId, ctx.auth.user.id);
+
             const [createdMeeting] = await db
                 .insert(meetings)
                 .values({

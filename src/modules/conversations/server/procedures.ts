@@ -6,6 +6,7 @@ import { TRPCError } from "@trpc/server";
 import { and, count, desc, eq, getTableColumns, ilike } from "drizzle-orm";
 import z from "zod";
 import { conversationsInsertSchema } from "../schema";
+import { assertAgentOwned } from "@/lib/authz";
 
 export const conversationsRouter = createTRPCRouter({
     // Define your procedures here
@@ -84,6 +85,8 @@ export const conversationsRouter = createTRPCRouter({
         }),
     create: protectedProcedure.input(conversationsInsertSchema)
         .mutation(async ({ ctx, input }) => {
+            await assertAgentOwned(input.agentId, ctx.auth.user.id);
+
             const [createdConversation] = await db
                 .insert(conversations)
                 .values({
@@ -91,20 +94,6 @@ export const conversationsRouter = createTRPCRouter({
                     userId: ctx.auth.user.id,
                 })
                 .returning();
-
-            const [existingAgent] = await db
-                .select()
-                .from(agents)
-                .where(
-                    eq(agents.id, createdConversation.agentId)
-                );
-
-            if (!existingAgent) {
-                throw new TRPCError({
-                    code: "NOT_FOUND",
-                    message: "Agent not found for the conversation",
-                });
-            }
 
             return createdConversation;
         }),

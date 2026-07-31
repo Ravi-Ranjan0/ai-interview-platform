@@ -1,21 +1,12 @@
 import { createTRPCRouter, protectedProcedure } from "@/trpc/init";
 import { db } from "@/db";
-import { agents, documents } from "@/db/schema";
+import { documents } from "@/db/schema";
 import { z } from "zod";
 import { eq, and, desc } from "drizzle-orm";
 import { TRPCError } from "@trpc/server";
 import { inngest } from "@/inngest/client";
 import { qdrant } from "@/lib/qdrant";
-
-async function assertAgentOwned(agentId: string, userId: string) {
-  const [row] = await db
-    .select({ id: agents.id })
-    .from(agents)
-    .where(and(eq(agents.id, agentId), eq(agents.userId, userId)));
-  if (!row) {
-    throw new TRPCError({ code: "NOT_FOUND", message: "Agent not found." });
-  }
-}
+import { assertAgentOwned } from "@/lib/authz";
 
 export const documentsRouter = createTRPCRouter({
   create: protectedProcedure
