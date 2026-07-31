@@ -34,8 +34,10 @@ export const messagesRouter = createTRPCRouter({
         .orderBy(asc(messages.createdAt));
 
       return rows.map((msg) => ({
-        fromSelf: msg.userId === ctx.auth.user.id,
+        fromSelf: msg.sender === "user",
+        sender: msg.sender,
         message: msg.content,
+        metadata: msg.metadata,
         createdAt: msg.createdAt,
       }));
     }),

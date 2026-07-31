@@ -1,5 +1,89 @@
 # Audit Log
 
+## Feature — B7 Test my agent — 2026-08-01
+### Spec
+A "Test" tab on the agent detail page that exercises the RAG chat pipeline
+end-to-end without needing a real interview. On first message it creates (or
+reuses) a hidden `__test__` conversation for the current user + agent, sends
+via the existing `messages.addMessage` → `agent/message` Inngest → agent reply
+flow, and renders both the reply and the list of document chunks the agent
+retrieved for that turn. This is a debug tool first, not a chat product.
+
+Scope boundary: reuses the real `conversations`/`messages` tables (title
+`__test__` filtered out of `conversations.getMany`). Does not expose relevance
+scores as a chart, does not stream, does not surface latency/token metrics.
+
+### Built this cycle
+- **Schema**: added nullable `messages.metadata TEXT` column. Requires
+  `npm run db:push` locally — session has no DB creds so this is documented
+  rather than executed. Column is additive; existing rows are NULL. [src/db/schema.ts:96]
+- **Handler**: `agentChatHandler` now returns retrieval `sources`
+  (`fileName, url, section, score`) from the RAG step and persists them as
+  `JSON.stringify({sources})` in the agent-reply row's `metadata`. Non-RAG
+  turns leave `metadata` NULL. [src/inngest/functions.ts]
+- **tRPC**:
+  - `conversations.getOrCreateTest(agentId)` — new mutation, gated by
+    `assertAgentOwned`. Returns existing `__test__` conversation for
+    user+agent or creates one. [src/modules/conversations/server/procedures.ts:101]
+  - `conversations.getMany` — hides `__test__` conversations from normal
+    listings (title != "__test__" in both data + count queries).
+  - `messages.getMessages` — now returns `{sender, metadata, ...}` and fixes
+    the `fromSelf` calc: was based on `userId === ctx.auth.user.id`, which
+    since cycle 2's FK fix was true for both user and agent messages
+    (agent replies borrow the owner's userId). Now uses `sender === "user"`.
+    Incidental correctness fix that also happens to matter for the real chat UI.
+- **UI**: `src/modules/agents/ui/components/test-agent.tsx` — panel with
+  message list, per-agent-reply "Retrieved N sources" section, per-file badge,
+  input + Send. Polls `getMessages` only while the last message is the user's
+  (i.e. waiting for the reply). New "Test" tab wired into agent detail page.
+- **Ownership**: only new writer added is `conversations.getOrCreateTest`,
+  which calls `assertAgentOwned` first — cycle-3 helper reused as required.
+
+### Verification
+- **Compiled**: tsc 0 errors, `npm run build` green.
+- **Functionally exercised**: NOT this session. Requires (1) `db:push` to add
+  the metadata column, (2) live Qdrant with real embeddings for an agent
+  that has uploaded documents, (3) live Inngest to run `agentChatHandler`.
+  Live-env checklist:
+    1. `npm run db:push` to add `messages.metadata`.
+    2. Create an agent, upload a document (existing KB tab).
+    3. Wait for `processDocumentEmbeddings` to complete (status → completed).
+    4. Open Test tab, ask a question referencing the doc content.
+    5. Confirm reply arrives and "Retrieved N sources" lists the doc filename
+       with a score.
+    6. Confirm the `__test__` conversation is NOT visible in `/conversations`.
+
+### Deferred (explicitly out of scope this increment)
+- **Streaming replies** — polling every 1.5s while waiting is enough for a
+  debug tool.
+- **Full metrics** — no LLM latency, token count, or per-step timing yet.
+  Add when a retrieval failure investigation actually needs them.
+- **Multi-turn context in retrieval** — retriever still uses only the current
+  user message; conversation history isn't embedded. Existing production
+  behavior; not this feature's job to change.
+- **Reset / delete test conversation** — no button today. Delete via
+  `/conversations/[id]` if it becomes noisy (though it's hidden from listings).
+- **Item 4 (embedding.ts rewrite)** and **Item 13 (avatar consolidation)**
+  from cycle 2.5 remain deferred pending live-env verification.
+
+### Notes
+- The `messages.metadata` column is now a general hook for future features
+  needing per-message side data (per-chunk scores in a real debug panel,
+  audit trails, moderation flags). Next audit cycle should look at it once
+  a second reader exists.
+- The `__test__` title-string filter is a quiet coupling: any change to how
+  test conversations are marked has to update the `ne(title, "__test__")`
+  filters in `conversations.getMany`. Cheap now (two lines, one file); if a
+  third reason to hide a conversation shows up, promote to a boolean column
+  (`isHidden` or an enum).
+- `messages.getMessages`'s `fromSelf` was wrong in a way no existing UI
+  currently exercises the corrected side of (the real chat UI's chat-connect
+  renders both sides via `fromSelf`, so before this fix agent replies also
+  rendered as the user's own messages — likely a latent bug in the real
+  chat page too, now fixed as a side effect).
+
+---
+
 ## Cycle 2.6 — Cleanup (orphaned deps + stragglers) — 2026-08-01
 ### Scope
 Second ponytail-audit sweep, one cycle after 2.5. Finds what 2.5 didn't:

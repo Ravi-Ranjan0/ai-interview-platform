@@ -3,7 +3,7 @@ import { db } from "@/db";
 import { agents, conversations } from "@/db/schema";
 import { createTRPCRouter, protectedProcedure } from "@/trpc/init";
 import { TRPCError } from "@trpc/server";
-import { and, count, desc, eq, getTableColumns, ilike } from "drizzle-orm";
+import { and, count, desc, eq, getTableColumns, ilike, ne } from "drizzle-orm";
 import z from "zod";
 import { conversationsInsertSchema } from "../schema";
 import { assertAgentOwned } from "@/lib/authz";
@@ -54,6 +54,7 @@ export const conversationsRouter = createTRPCRouter({
                 .where(
                     and(
                         eq(conversations.userId, ctx.auth.user.id),
+                        ne(conversations.title, "__test__"),
                         search ? ilike(conversations.title, `%${search}%`) : undefined,
                         agentId ? eq(conversations.agentId, agentId) : undefined,
                     )
@@ -71,6 +72,7 @@ export const conversationsRouter = createTRPCRouter({
                 .where(
                     and(
                         eq(conversations.userId, ctx.auth.user.id),
+                        ne(conversations.title, "__test__"),
                         agentId ? eq(conversations.agentId, agentId) : undefined,
                         search ? ilike(conversations.title, `%${search}%`) : undefined,
                     )
@@ -96,6 +98,40 @@ export const conversationsRouter = createTRPCRouter({
                 .returning();
 
             return createdConversation;
+        }),
+
+    // Returns an existing "Test — <agent>" conversation for this user+agent,
+    // or creates one. Used by the Test Agent panel on the agent detail page.
+    getOrCreateTest: protectedProcedure
+        .input(z.object({ agentId: z.string() }))
+        .mutation(async ({ ctx, input }) => {
+            await assertAgentOwned(input.agentId, ctx.auth.user.id);
+
+            const title = "__test__";
+            const [existing] = await db
+                .select({ id: conversations.id })
+                .from(conversations)
+                .where(
+                    and(
+                        eq(conversations.userId, ctx.auth.user.id),
+                        eq(conversations.agentId, input.agentId),
+                        eq(conversations.title, title),
+                    )
+                )
+                .limit(1);
+
+            if (existing) return { id: existing.id };
+
+            const [created] = await db
+                .insert(conversations)
+                .values({
+                    title,
+                    userId: ctx.auth.user.id,
+                    agentId: input.agentId,
+                })
+                .returning({ id: conversations.id });
+
+            return { id: created.id };
         }),
 
 });

@@ -426,7 +426,7 @@ export const agentChatHandler = inngest.createFunction(
     const instructionsText = agent.instructions ?? "";
 
     // 2) RAG retrieval: embed user question and search Qdrant
-    const ragContext = await step.run("rag-retrieval", async () => {
+    const retrieval = await step.run("rag-retrieval", async () => {
       try {
         const queryVector = await geminiEmbeddings.embedQuery(content);
 
@@ -441,7 +441,22 @@ export const agentChatHandler = inngest.createFunction(
           score_threshold: 0.5,
         });
 
-        if (searchResults.length === 0) return "";
+        if (searchResults.length === 0) return { context: "", sources: [] };
+
+        const sources = searchResults.map((r) => {
+          const payload = r.payload as {
+            text?: string;
+            url?: string;
+            section?: string;
+            fileName?: string;
+          };
+          return {
+            fileName: payload.fileName,
+            url: payload.url,
+            section: payload.section,
+            score: r.score,
+          };
+        });
 
         const contextParts = searchResults.map((result, i) => {
           const payload = result.payload as {
@@ -454,12 +469,15 @@ export const agentChatHandler = inngest.createFunction(
           return `[Source ${i + 1}: ${source}${payload.section ? ` - ${payload.section}` : ""}]\n${payload.text}`;
         });
 
-        return contextParts.join("\n\n---\n\n");
+        return { context: contextParts.join("\n\n---\n\n"), sources };
       } catch (error) {
         console.error("RAG retrieval failed, falling back to instructions only:", error);
-        return "";
+        return { context: "", sources: [] };
       }
     });
+
+    const ragContext = retrieval.context;
+    const retrievalSources = retrieval.sources;
 
     // 3) Build prompt with RAG context
     const prompt = `
@@ -482,16 +500,17 @@ ${content}
     const { output } = await instructionOnlyAgent.run(prompt);
     const reply = (output[0] as TextMessage).content as string;
 
-    // 4) Save reply
-    // ponytail: messages.userId FKs to user.id, so agent replies borrow the
-    // conversation owner's userId. `sender` distinguishes the actual author.
-    // Upgrade path: make messages.userId nullable if we ever need "system" msgs.
+    // 4) Save reply. metadata carries retrieval sources for the Test Agent UI
+    // and any future debug panels. Non-agent readers can ignore it.
     await step.run("save-agent-reply", async () => {
       await db.insert(messages).values({
         conversationId,
         userId,
         sender: "agent",
         content: reply,
+        metadata: retrievalSources.length > 0
+          ? JSON.stringify({ sources: retrievalSources })
+          : null,
       });
     });
 

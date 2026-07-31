@@ -93,6 +93,7 @@ export const messages = pgTable("messages", {
   userId: text('user_id').notNull().references(() => user.id, { onDelete: 'cascade' }),
   sender: text('sender').notNull(), // 'user' or 'agent'
   content: text('content').notNull(),
+  metadata: text('metadata'), // JSON string; agent replies carry retrieval sources for debug/test UIs
   createdAt: timestamp('created_at').notNull().defaultNow(),
 });
 
