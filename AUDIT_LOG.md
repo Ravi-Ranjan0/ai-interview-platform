@@ -1,5 +1,102 @@
 # Audit Log
 
+## Feature — B6 URL re-crawl — 2026-08-01
+### Spec
+New "Crawled URLs" panel on the agent detail page (under Knowledge Base)
+listing the agent's URLs, a per-agent crawl status badge, and a **Re-crawl**
+button. Both agent creation and manual re-crawl now dispatch to a single
+Inngest function (`agents/crawl-urls`) — no more sync Playwright in a tRPC
+mutation. Re-crawl **replaces** all prior URL-sourced vectors for the agent
+(discriminator: Qdrant filter `must agentId=X + must_not documentId exists`),
+then re-embeds via the existing `agents/generate-embeddings` pipeline.
+
+Scope boundary: single per-agent status flag (`idle|pending|processing|
+completed|failed`) + `urlsUpdatedAt` timestamp — no per-URL state, no diffing
+which URLs changed, no auto-recrawl on URL edit.
+
+### Built this cycle
+- **Schema**: added `urls_status` enum + `agents.{urlsStatus, urlsUpdatedAt,
+  urlsError}` columns. Requires `npm run db:push` locally (no DB creds this
+  session). Additive; existing rows default to `idle` / NULL. [src/db/schema.ts]
+- **Inngest**: new `crawlAgentUrls` function on event `agents/crawl-urls`
+  — marks processing, clears prior URL vectors from Qdrant, launches
+  Playwright with a `finally { browser.close() }`, dispatches
+  `agents/generate-embeddings` for the results, marks completed/failed with
+  timestamp + error. Registered in `/api/inngest/route.ts`.
+  [src/inngest/functions.ts]
+- **tRPC**:
+  - `agents.create` — sync crawl block **removed**. Now writes the agent
+    with `urlsStatus: "pending"` if URLs are provided, then dispatches
+    `agents/crawl-urls`. Also removed unused `playwright`/`crawlWebsitePlaywright`
+    imports at the top of the file.
+  - `agents.recrawlUrls(id)` — new mutation, gated by `assertAgentOwned`.
+    Reads current URLs from DB, marks pending, dispatches crawl event.
+  - [src/modules/agents/server/procedures.ts]
+- **UI**: `src/modules/agents/ui/components/agent-urls.tsx` — panel with
+  URL list, status badge, Re-crawl button (disabled while in-flight or if
+  no URLs), and last-crawled timestamp. Polls `agents.getOne` every 3s
+  only while `urlsStatus ∈ {pending, processing}`. Wired into the Knowledge
+  Base tab.
+- **A11 fix**: `crawlWebsitePlaywright` now wraps the page's `goto` +
+  `content` + `$$eval` in a `try { ... } finally { await page.close() }`, so
+  a throw between `newPage` and the extraction no longer leaks the page.
+  [src/utils/web-crawler.ts]
+- **Ownership**: only new writer is `agents.recrawlUrls`; uses
+  `assertAgentOwned` per cycle-3 rule.
+
+### A10/A11 status
+- **A10 CLOSED**: no remaining call site launches Playwright inside a
+  request-path handler. Both flows (create + re-crawl) dispatch to
+  `agents/crawl-urls` and return immediately.
+- **A11 CLOSED**: `page.close()` is now in a `finally` (also `.catch(() => {})`
+  so a close-time error doesn't mask the primary throw).
+
+### Verification
+- **Compiled**: tsc 0 errors; `npm run build` green.
+- **Functionally exercised**: NOT this session. Needs (1) `db:push` to add
+  the three columns, (2) a live agent with URLs, (3) live Inngest to run
+  `crawlAgentUrls`, (4) live Qdrant to observe delete + upsert. Checklist:
+    1. `npm run db:push`
+    2. Create an agent with 1–2 URLs; confirm mutation returns quickly and
+       Knowledge Base → Crawled URLs shows `pending → processing → completed`.
+    3. Click Re-crawl on the same agent; watch the badge cycle again,
+       confirm `urlsUpdatedAt` refreshes.
+    4. On the Test tab, ask a question that only URL content answers;
+       confirm the reply cites those sources (no `fileName` — only `url`).
+    5. Delete a URL, save, Re-crawl; ask a question about the removed
+       URL's content — should return "I don't know" (proves delete cleared
+       old vectors).
+
+### Deferred (explicitly out of scope this increment)
+- **Per-URL status** (each URL as its own row with individual retry). Would
+  need an `agent_urls` table — disproportionate until per-URL failures
+  actually cause debugging pain.
+- **Diff / partial re-crawl** — always re-crawls the full list.
+- **Auto-recrawl on URL edit** — user must click Re-crawl explicitly.
+- **Streaming per-page crawl progress** — polling every 3s is enough.
+- **A8** (Qdrant collection-wipe on dimension mismatch) — untouched; still
+  a global-blast concern on any embed-model change.
+- **Legacy URL points from prior crawls** are already excluded from the
+  "docs" set via the `must_not documentId` filter, so the delete-then-insert
+  semantic works today. Optional future cleanup: tag all URL points with
+  `sourceType: "url"` explicitly.
+
+### Notes
+- `agents/crawl-urls` and `agents/generate-embeddings` are now two links in
+  a chain: the first dispatches the second. Any future "crawl only" or
+  "embed only" callers plug into the same pipeline without duplicating the
+  Playwright launch. If a *third* caller for `agents/generate-embeddings`
+  appears (e.g. a "bulk import" tool), the shared event contract already
+  handles it.
+- The new `urls_status` enum shares shape with `document_status` but is a
+  separate type. If a third `*_status` shows up, consider consolidating —
+  for now, two independent enums beats a shared abstraction.
+- `agents.recrawlUrls` throws `BAD_REQUEST` if the agent has no URLs — the
+  UI's disabled state should keep this from ever hitting, but the server
+  guard makes it safe against manual clients.
+
+---
+
 ## Feature — B7 Test my agent — 2026-08-01
 ### Spec
 A "Test" tab on the agent detail page that exercises the RAG chat pipeline

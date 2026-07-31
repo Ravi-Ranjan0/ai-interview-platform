@@ -48,13 +48,23 @@ export const verification = pgTable("verification", {
   updatedAt: timestamp('updated_at').$defaultFn(() => /* @__PURE__ */ new Date())
 });
 
+export const urlsStatus = pgEnum("urls_status", [
+  "idle",
+  "pending",
+  "processing",
+  "completed",
+  "failed",
+]);
+
 export const agents = pgTable("agents", {
   id: text('id').primaryKey().$defaultFn(() => nanoid()),
   name: text('name').notNull(),
   userId: text('user_id').notNull().references(() => user.id, { onDelete: 'cascade' }),
   instructions: text('instructions').notNull(),
-  urls: text('urls'),  // Comma-separated URLs
-  // pdfUrl: text('pdf_url'),
+  urls: text('urls'),  // JSON-stringified array of URLs
+  urlsStatus: urlsStatus('urls_status').notNull().default("idle"),
+  urlsUpdatedAt: timestamp('urls_updated_at'),
+  urlsError: text('urls_error'),
   lastResponse: text('last_response'),
   createdAt: timestamp('created_at').notNull().defaultNow(),
   updatedAt: timestamp('updated_at').notNull().defaultNow(),

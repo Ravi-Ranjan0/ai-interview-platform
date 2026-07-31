@@ -19,6 +19,7 @@ import { UpdateAgentDialog } from "../components/update-agent-dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { KnowledgeBase } from "../components/knowledge-base";
 import { TestAgent } from "../components/test-agent";
+import { AgentUrls } from "../components/agent-urls";
 import { Loader2Icon } from "lucide-react";
 
 interface Props {
@@ -111,15 +112,18 @@ export const AgentIdView = ({ agentId }: Props) => {
             </div>
           </TabsContent>
           <TabsContent value="knowledge">
-            <Suspense
-              fallback={
-                <div className="flex items-center justify-center py-12">
-                  <Loader2Icon className="size-6 animate-spin text-muted-foreground" />
-                </div>
-              }
-            >
-              <KnowledgeBase agentId={agentId} />
-            </Suspense>
+            <div className="flex flex-col gap-y-4">
+              <Suspense
+                fallback={
+                  <div className="flex items-center justify-center py-12">
+                    <Loader2Icon className="size-6 animate-spin text-muted-foreground" />
+                  </div>
+                }
+              >
+                <KnowledgeBase agentId={agentId} />
+              </Suspense>
+              <AgentUrls agentId={agentId} />
+            </div>
           </TabsContent>
           <TabsContent value="test">
             <TestAgent agentId={agentId} />

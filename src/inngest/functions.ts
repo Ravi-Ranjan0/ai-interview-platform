@@ -617,3 +617,97 @@ export const processDocumentEmbeddings = inngest.createFunction(
   }
 );
 
+
+// Crawl an agent's URL list off the request path (was A10: sync-in-mutation).
+// Idempotent — clears prior URL-sourced vectors for this agent, then re-embeds
+// via the existing generateAndStoreEmbeddings function.
+export const crawlAgentUrls = inngest.createFunction(
+  { id: "agents-crawl-urls" },
+  { event: "agents/crawl-urls" },
+  async ({ event, step }) => {
+    const { agentId, urls } = event.data as { agentId: string; urls: string[] };
+    if (!urls || urls.length === 0) {
+      return { success: false, reason: "No URLs provided" };
+    }
+
+    await ensureAgentCollection();
+
+    await step.run("mark-processing", async () => {
+      await db
+        .update(agents)
+        .set({ urlsStatus: "processing", urlsError: null, updatedAt: new Date() })
+        .where(eq(agents.id, agentId));
+    });
+
+    // Delete prior URL-sourced vectors for this agent.
+    // Discriminator: URL points have `url`, no `documentId`. Document points
+    // have `documentId`. So `must agentId=X + must_not documentId exists`.
+    await step.run("clear-url-vectors", async () => {
+      try {
+        const filter = {
+          must: [{ key: "agentId", match: { value: agentId } }],
+          must_not: [{ is_empty: { key: "documentId" } }],
+        };
+        // Qdrant delete supports a filter form; the SDK's overload types are
+        // ambiguous here so we cast the whole options bag.
+        await qdrant.delete("agents", { filter, wait: true } as never);
+      } catch (err) {
+        // ponytail: best-effort cleanup — if Qdrant rejects the filter we
+        // still proceed to re-crawl, and the worst case is duplicate points.
+        console.error(`Qdrant URL-vector cleanup failed for agent ${agentId}:`, err);
+      }
+    });
+
+    // Crawl. Playwright + per-page Gemini cleanup happen here in the
+    // background, not in a tRPC mutation (was A10).
+    const allPages = await step.run("crawl", async () => {
+      const { chromium } = await import("playwright");
+      const { crawlWebsitePlaywright } = await import("@/utils/web-crawler");
+      const pages: { url: string; text: string }[] = [];
+      const visitedUrls = new Set<string>();
+      const browser = await chromium.launch({ headless: true });
+      try {
+        for (const url of urls) {
+          await crawlWebsitePlaywright(url, pages, browser, 3, 0, visitedUrls, 10);
+        }
+      } finally {
+        await browser.close().catch(() => {});
+      }
+      return pages;
+    });
+
+    if (allPages.length === 0) {
+      await step.run("mark-failed", async () => {
+        await db
+          .update(agents)
+          .set({
+            urlsStatus: "failed",
+            urlsError: "No content extracted from provided URLs",
+            urlsUpdatedAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(eq(agents.id, agentId));
+      });
+      return { success: false, reason: "No content extracted" };
+    }
+
+    // Reuse the existing embed pipeline verbatim.
+    await step.sendEvent("dispatch-embeddings", {
+      name: "agents/generate-embeddings",
+      data: { agentId, pages: allPages, url: urls[0] },
+    });
+
+    await step.run("mark-completed", async () => {
+      await db
+        .update(agents)
+        .set({
+          urlsStatus: "completed",
+          urlsUpdatedAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(agents.id, agentId));
+    });
+
+    return { success: true, pagesCrawled: allPages.length };
+  }
+);

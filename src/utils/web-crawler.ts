@@ -97,23 +97,26 @@ export async function crawlWebsitePlaywright(
 
   visitedUrls.add(url);
 
+  let html = "";
+  let links: string[] = [];
+
   try {
+    // ponytail: finally-close so a throw between newPage and $$eval doesn't
+    // leak a Playwright page. Was A11 in the audit log.
     const page = await browser.newPage();
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-
-    // Get full HTML for Cheerio processing
-    const html = await page.content();
-
-    // Extract links before closing the page
-    const links: string[] = await page.$$eval(
-      "a[href]",
-      (anchors: HTMLAnchorElement[]) =>
-        anchors
-          .map((a: HTMLAnchorElement) => a.getAttribute("href"))
-          .filter((h): h is string => !!h)
-    );
-
-    await page.close();
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+      html = await page.content();
+      links = await page.$$eval(
+        "a[href]",
+        (anchors: HTMLAnchorElement[]) =>
+          anchors
+            .map((a: HTMLAnchorElement) => a.getAttribute("href"))
+            .filter((h): h is string => !!h)
+      );
+    } finally {
+      await page.close().catch(() => {});
+    }
 
     console.log(`Crawling (depth ${currentDepth}): ${url}`);
 

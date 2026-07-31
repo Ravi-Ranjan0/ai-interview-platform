@@ -7,8 +7,7 @@ import { eq, getTableColumns, count, sql, and, ilike, desc } from "drizzle-orm";
 import { DEFAULT_PAGE, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "@/constant";
 import { TRPCError } from "@trpc/server";
 import { inngest } from "@/inngest/client";
-import { chromium } from "playwright";
-import { crawlWebsitePlaywright } from "@/utils/web-crawler";
+import { assertAgentOwned } from "@/lib/authz";
 
 
 export const agentsRouter = createTRPCRouter({
@@ -147,69 +146,75 @@ export const agentsRouter = createTRPCRouter({
     create: protectedProcedure
         .input(agentsInsertSchema)
         .mutation(async ({ input, ctx }) => {
-            const insertPayload = {
-                ...input,
-                urls: input.urls ? JSON.stringify(input.urls) : null,
-                userId: ctx.auth.user.id, // Assuming user.id is available in the context
-            };
-
+            const hasUrls = !!input.urls && input.urls.length > 0;
             const [createdAgent] = await db
                 .insert(agents)
-                .values(insertPayload)
+                .values({
+                    ...input,
+                    urls: hasUrls ? JSON.stringify(input.urls) : null,
+                    urlsStatus: hasUrls ? "pending" : "idle",
+                    userId: ctx.auth.user.id,
+                })
                 .returning();
 
-            if (input.urls && input.urls.length > 0) {
-                // const allTexts: string[] = [];
-                const allPages: { url: string; text: string }[] = [];
-                const visitedUrls = new Set<string>();
-
-                const browser = await chromium.launch({ headless: true });
-
-                try {
-                    for (const url of input.urls) {
-                        await crawlWebsitePlaywright(
-                            url,
-                            allPages,
-                            browser,
-                            3, // maxDepth
-                            0, // currentDepth
-                            visitedUrls,
-                            10
-                        );
-                    }
-                } finally {
-                    await browser.close();
-                }
-
-                console.log(`📚 Total extracted text chunks from all URLs: ${allPages.length}`);
-                console.log(`🔗 Crawled URLs:`, Array.from(visitedUrls));
-                console.log(`🔗 Crawled a total of ${visitedUrls.size} unique URLs`);
-                console.log(`📚 Extracted a total of ${allPages.length} text chunks from crawled URLs`);
-
-                if (allPages.length > 0) {
-                    await inngest.send({
-                        name: "agents/generate-embeddings",
-                        data: {
-                            agentId: createdAgent.id,
-                            // texts: allTexts,
-                            pages: allPages.map(page => ({ url: page.url, text: page.text })),
-                            url: input.urls[0], // reference first URL
-                        },
-                    });
-                    console.log("🚀 Triggered embeddings generation via Inngest");
-                } else {
-                    console.warn("⚠️ No valid text extracted from provided URLs");
-                }
+            if (hasUrls) {
+                // A10 fix: crawl runs in background, not inline in the mutation.
+                await inngest.send({
+                    name: "agents/crawl-urls",
+                    data: { agentId: createdAgent.id, urls: input.urls! },
+                });
             }
-
 
             await inngest.send({
                 name: "agents/questions",
-                data: {
-                    agentId: createdAgent.id
-                },
-            })
+                data: { agentId: createdAgent.id },
+            });
 
             return createdAgent;
+        }),
+
+    recrawlUrls: protectedProcedure
+        .input(z.object({ id: z.string() }))
+        .mutation(async ({ ctx, input }) => {
+            await assertAgentOwned(input.id, ctx.auth.user.id);
+
+            const [agent] = await db
+                .select({ id: agents.id, urls: agents.urls })
+                .from(agents)
+                .where(eq(agents.id, input.id));
+
+            if (!agent) {
+                throw new TRPCError({ code: "NOT_FOUND", message: "Agent not found" });
+            }
+
+            const urls: string[] = agent.urls
+                ? (() => {
+                    try {
+                        const parsed = JSON.parse(agent.urls!);
+                        return Array.isArray(parsed) ? parsed.filter((u): u is string => typeof u === "string") : [];
+                    } catch {
+                        return [];
+                    }
+                })()
+                : [];
+
+            if (urls.length === 0) {
+                throw new TRPCError({
+                    code: "BAD_REQUEST",
+                    message: "This agent has no URLs to crawl.",
+                });
+            }
+
+            await db
+                .update(agents)
+                .set({ urlsStatus: "pending", urlsError: null, updatedAt: new Date() })
+                .where(eq(agents.id, input.id));
+
+            await inngest.send({
+                name: "agents/crawl-urls",
+                data: { agentId: input.id, urls },
+            });
+
+            return { success: true, urls };
         }),
 });
