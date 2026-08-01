@@ -42,7 +42,10 @@ async function buildAgentSessionContext(agentId: string): Promise<string> {
         }
         return parts.join("\n\n---\n\n");
     } catch (err) {
-        console.error(`Failed to build RAG context for agent ${agentId}:`, err);
+        // Interview proceeds with instructions only, but log with a
+        // greppable prefix so ops can find silent RAG regressions.
+        // Was N2 in cycle 4.
+        console.error(`[interview-rag-fallback] agent=${agentId}`, err);
         return "";
     }
 }

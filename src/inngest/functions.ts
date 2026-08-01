@@ -441,7 +441,7 @@ export const agentChatHandler = inngest.createFunction(
           score_threshold: 0.5,
         });
 
-        if (searchResults.length === 0) return { context: "", sources: [] };
+        if (searchResults.length === 0) return { context: "", sources: [], error: null };
 
         const sources = searchResults.map((r) => {
           const payload = r.payload as {
@@ -469,15 +469,23 @@ export const agentChatHandler = inngest.createFunction(
           return `[Source ${i + 1}: ${source}${payload.section ? ` - ${payload.section}` : ""}]\n${payload.text}`;
         });
 
-        return { context: contextParts.join("\n\n---\n\n"), sources };
+        return { context: contextParts.join("\n\n---\n\n"), sources, error: null };
       } catch (error) {
-        console.error("RAG retrieval failed, falling back to instructions only:", error);
-        return { context: "", sources: [] };
+        // Fallback keeps the reply flowing, but surface the failure on the
+        // message's metadata so the UI can distinguish "no relevant sources"
+        // from "retrieval broke". Was N1 in cycle 4.
+        console.error("[chat-rag-fallback] retrieval failed for agent", agentId, error);
+        return {
+          context: "",
+          sources: [],
+          error: error instanceof Error ? error.message : "retrieval failed",
+        };
       }
     });
 
     const ragContext = retrieval.context;
     const retrievalSources = retrieval.sources;
+    const retrievalError = retrieval.error;
 
     // 3) Build prompt with RAG context
     const prompt = `
@@ -500,17 +508,20 @@ ${content}
     const { output } = await instructionOnlyAgent.run(prompt);
     const reply = (output[0] as TextMessage).content as string;
 
-    // 4) Save reply. metadata carries retrieval sources for the Test Agent UI
-    // and any future debug panels. Non-agent readers can ignore it.
+    // 4) Save reply. metadata carries retrieval sources for the chat UI
+    // and any future debug panels; retrievalError surfaces silent-failure
+    // regressions. Non-agent readers can ignore it.
     await step.run("save-agent-reply", async () => {
+      const meta: { sources?: unknown[]; retrievalError?: string } = {};
+      if (retrievalSources.length > 0) meta.sources = retrievalSources;
+      if (retrievalError) meta.retrievalError = retrievalError;
+
       await db.insert(messages).values({
         conversationId,
         userId,
         sender: "agent",
         content: reply,
-        metadata: retrievalSources.length > 0
-          ? JSON.stringify({ sources: retrievalSources })
-          : null,
+        metadata: Object.keys(meta).length > 0 ? JSON.stringify(meta) : null,
       });
     });
 

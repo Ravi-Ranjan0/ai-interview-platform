@@ -11,7 +11,7 @@ import { useTRPC } from "@/trpc/clients";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Loader2Icon, SendHorizonalIcon, FileIcon, LinkIcon, SparklesIcon } from "lucide-react";
+import { Loader2Icon, SendHorizonalIcon, FileIcon, LinkIcon, SparklesIcon, AlertTriangleIcon } from "lucide-react";
 import { toast } from "sonner";
 import Markdown from "react-markdown";
 import { GeneratedAvatar } from "@/components/generated-avatar";
@@ -24,13 +24,24 @@ type Source = {
   score?: number;
 };
 
-function parseSources(metadata: string | null | undefined): Source[] {
-  if (!metadata) return [];
+type ReplyMeta = {
+  sources: Source[];
+  retrievalError: string | null;
+};
+
+function parseMeta(metadata: string | null | undefined): ReplyMeta {
+  if (!metadata) return { sources: [], retrievalError: null };
   try {
-    const parsed = JSON.parse(metadata) as { sources?: Source[] };
-    return parsed.sources ?? [];
+    const parsed = JSON.parse(metadata) as {
+      sources?: Source[];
+      retrievalError?: string;
+    };
+    return {
+      sources: parsed.sources ?? [],
+      retrievalError: parsed.retrievalError ?? null,
+    };
   } catch {
-    return [];
+    return { sources: [], retrievalError: null };
   }
 }
 
@@ -90,7 +101,7 @@ interface Props {
   agentName: string;
 }
 
-export const TestAgent = ({ agentId, agentName }: Props) => {
+export const AgentChat = ({ agentId, agentName }: Props) => {
   const trpc = useTRPC();
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [input, setInput] = useState("");
@@ -99,7 +110,7 @@ export const TestAgent = ({ agentId, agentName }: Props) => {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const getOrCreate = useMutation(
-    trpc.conversations.getOrCreateTest.mutationOptions({
+    trpc.conversations.getOrCreateChat.mutationOptions({
       onSuccess: ({ id }) => setConversationId(id),
       onError: (e) => toast.error(e.message),
     })
@@ -206,7 +217,8 @@ export const TestAgent = ({ agentId, agentName }: Props) => {
 
         {rows.map((m, i) => {
           const isUser = m.sender === "user";
-          const sources = !isUser ? parseSources(m.metadata) : [];
+          const meta = !isUser ? parseMeta(m.metadata) : { sources: [], retrievalError: null };
+          const { sources, retrievalError } = meta;
           const sourcesOpen = showSourcesFor === i;
 
           return (
@@ -249,6 +261,12 @@ export const TestAgent = ({ agentId, agentName }: Props) => {
                   )}
                 </div>
 
+                {retrievalError && (
+                  <div className="flex items-center gap-x-1 text-xs text-amber-600">
+                    <AlertTriangleIcon className="size-3 shrink-0" />
+                    <span>Sources unavailable — reply is from instructions only.</span>
+                  </div>
+                )}
                 {sources.length > 0 && (
                   <div className="flex flex-col gap-y-1.5 max-w-full">
                     <button

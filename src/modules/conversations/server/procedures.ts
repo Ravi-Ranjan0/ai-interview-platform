@@ -100,9 +100,11 @@ export const conversationsRouter = createTRPCRouter({
             return createdConversation;
         }),
 
-    // Returns an existing "Test — <agent>" conversation for this user+agent,
-    // or creates one. Used by the Test Agent panel on the agent detail page.
-    getOrCreateTest: protectedProcedure
+    // Returns an existing chat conversation for this user+agent, or creates
+    // one. Used by the Chat panel on the agent detail page. The title marker
+    // "__test__" is a legacy internal identifier kept for data compatibility;
+    // it's invisible to users (filtered from getMany) and never renamed.
+    getOrCreateChat: protectedProcedure
         .input(z.object({ agentId: z.string() }))
         .mutation(async ({ ctx, input }) => {
             await assertAgentOwned(input.agentId, ctx.auth.user.id);

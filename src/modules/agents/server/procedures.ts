@@ -179,12 +179,21 @@ export const agentsRouter = createTRPCRouter({
             await assertAgentOwned(input.id, ctx.auth.user.id);
 
             const [agent] = await db
-                .select({ id: agents.id, urls: agents.urls })
+                .select({ id: agents.id, urls: agents.urls, urlsStatus: agents.urlsStatus })
                 .from(agents)
                 .where(eq(agents.id, input.id));
 
             if (!agent) {
                 throw new TRPCError({ code: "NOT_FOUND", message: "Agent not found" });
+            }
+
+            // In-flight guard (N3 fix). UI disables the button but a direct
+            // API caller could bypass; server enforces.
+            if (agent.urlsStatus === "pending" || agent.urlsStatus === "processing") {
+                throw new TRPCError({
+                    code: "CONFLICT",
+                    message: "A crawl is already in progress for this agent.",
+                });
             }
 
             const urls: string[] = agent.urls

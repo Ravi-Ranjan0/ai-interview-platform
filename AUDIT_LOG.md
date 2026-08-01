@@ -1,6 +1,95 @@
 # Audit Log
 
+## Cycle 4 — Silent-failure surface in background jobs — 2026-08-01
+### Scope
+New class per cycle-2.6 trend note ("scan for a new class"). Focus: silent
+correctness degradation in Inngest handlers + webhooks + concurrent-crawl
+races. Not authz (closed cycle 3), not dead code (closed cycle 2.6).
+
+### Fixed this cycle
+- **N1 — Chat RAG retrieval failure now surfaces to the user.**
+  `agentChatHandler` catches Qdrant failures with a fallback (as before)
+  but now persists `retrievalError` on `messages.metadata` alongside
+  `sources`. Log line changed to a greppable `[chat-rag-fallback]` prefix.
+  Chat UI renders a small amber "Sources unavailable — reply is from
+  instructions only." warning beneath the affected reply.
+  [src/inngest/functions.ts:471, src/modules/agents/ui/components/agent-chat.tsx]
+- **N2 — Interview session RAG fallback log now greppable.**
+  `buildAgentSessionContext` still returns empty context on failure (the
+  interview can't be blocked on a lookup miss), but the log line uses a
+  `[interview-rag-fallback]` prefix with agent id, so ops can find silent
+  regressions without spelunking through raw stack traces.
+  [src/app/api/webhook/route.ts:44]
+- **N3 — `agents.recrawlUrls` in-flight guard.** Reads current
+  `urlsStatus`; if `pending|processing`, throws `TRPCError CONFLICT`
+  ("A crawl is already in progress for this agent."). UI already disabled
+  the button in that state; server now enforces so direct API callers
+  can't double-fire the expensive crawl job.
+  [src/modules/agents/server/procedures.ts]
+
+### Verification
+- **Compiled**: tsc 0 errors, `npm run build` green.
+- **Functionally exercised**: NOT this session (needs live Inngest +
+  Qdrant to trigger the fallback paths). Live-env checklist:
+    1. In agent chat, temporarily point QDRANT_URL to a bad host; send a
+       message; confirm the reply arrives AND the amber "Sources
+       unavailable" chip renders beneath it.
+    2. Grep server logs for `[chat-rag-fallback]` and
+       `[interview-rag-fallback]` — should be the only markers when RAG
+       silently falls back.
+    3. In the URL panel, click Re-crawl; while status is still
+       `processing`, POST a second recrawl via curl — confirm it returns
+       CONFLICT and doesn't spawn a second Inngest run.
+
+### Deferred (explicitly out of scope)
+- **N4 — Untyped Inngest events.** 5 handlers cast `event.data as {...}`.
+  No live bug; retrofitting typed events for its own sake is over-
+  engineering. Adopt when a new event is added, at that event's PR.
+- **N5 — Env var validation at boot.** 8 `process.env.X!` sites; missing
+  vars surface as 500s on specific routes rather than a clean boot
+  failure. Wants a `src/lib/env.ts` with Zod schemas — cycle 5 candidate,
+  needs care around NEXT_PUBLIC_ vs server-only vars and Next's
+  edge/serverless boundary.
+- **A16 — Crawler per-URL failure telemetry.** Still open, still low
+  priority.
+- **Items 4 + 13 from cycle 2.5** — still waiting on live-env verification
+  (behavior changes).
+
+### Trend note
+Cycles-to-date classes:
+- Cycles 1-3: trust boundaries → closed (`assertAgentOwned`).
+- Cycles 2.5-2.6: dead code / orphan deps → closed.
+- Cycle 4: silent-failure surface → partially addressed (2 concrete
+  instances patched, pattern documented).
+
+The silent-failure class is *shape-similar* to the trust-boundary class:
+both are "the same defensive pattern applied inconsistently across many
+call sites." N1 and N2 were the two live instances; N3 is a related-but-
+different race that got bundled. If a third silent-failure instance shows
+up in cycle 5 or 6, treat it as class-level and consider a shared
+`fallbackWithTelemetry(name, fn, fallback)` helper — for now, two
+instances don't justify the abstraction.
+
+Next candidate class to scan: **type safety at external boundaries**
+(N4 + webhook signature payload types + tRPC input schemas that accept
+`z.string()` where a `z.string().url()` or enum would be tighter).
+
+---
+
 ## Feature — Chat UX polish (formerly B7 debug tool) — 2026-08-01
+### Follow-up rename (same day)
+Debug-era "test" naming was still surviving in identifiers after the UX
+polish landed. Renamed to match the product-shaped user text:
+- `TestAgent` → `AgentChat` (component)
+- `test-agent.tsx` → `agent-chat.tsx` (file; `git mv` to preserve history)
+- `conversations.getOrCreateTest` → `conversations.getOrCreateChat` (tRPC)
+- `<TabsTrigger value="test">` / `<TabsContent value="test">` →
+  `value="chat"` (both paired)
+Kept: DB conversation title marker `"__test__"`. It's an invisible internal
+identifier (filtered from `conversations.getMany`); renaming it would
+orphan existing rows in real databases without any user-facing benefit.
+The `getOrCreateChat` handler carries a comment explaining why.
+
 ### Spec
 Redesigned the existing `TestAgent` component from a debug-shaped panel
 into a real "chat with your documents" experience. Owner-only, same

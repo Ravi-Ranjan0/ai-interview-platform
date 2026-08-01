@@ -18,7 +18,7 @@ import { Suspense, useState } from "react";
 import { UpdateAgentDialog } from "../components/update-agent-dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { KnowledgeBase } from "../components/knowledge-base";
-import { TestAgent } from "../components/test-agent";
+import { AgentChat } from "../components/agent-chat";
 import { AgentUrls } from "../components/agent-urls";
 import { Loader2Icon } from "lucide-react";
 
@@ -83,7 +83,7 @@ export const AgentIdView = ({ agentId }: Props) => {
           <TabsList>
             <TabsTrigger value="details">Details</TabsTrigger>
             <TabsTrigger value="knowledge">Knowledge Base</TabsTrigger>
-            <TabsTrigger value="test">Chat</TabsTrigger>
+            <TabsTrigger value="chat">Chat</TabsTrigger>
           </TabsList>
           <TabsContent value="details">
             <div className="bg-white rounded-lg border">
@@ -125,8 +125,8 @@ export const AgentIdView = ({ agentId }: Props) => {
               <AgentUrls agentId={agentId} />
             </div>
           </TabsContent>
-          <TabsContent value="test">
-            <TestAgent agentId={agentId} agentName={data.name} />
+          <TabsContent value="chat">
+            <AgentChat agentId={agentId} agentName={data.name} />
           </TabsContent>
         </Tabs>
       </div>
