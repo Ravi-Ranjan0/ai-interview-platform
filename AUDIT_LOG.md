@@ -1,5 +1,130 @@
 # Audit Log
 
+## Feature — Crawling & RAG reliability fixes (user-reported) — 2026-08-03
+### Scope
+Direct response to user complaints: crawling is slow/times out, crawled
+content is incomplete/wrong, the interview agent seems to ignore resume/JD
+content, and Chat gives wrong or over-eager "I don't know" answers. Root
+cause work, not a scheduled audit cycle. User explicitly scoped this to the
+small/contained fixes below and deferred the bigger live-interview
+query-aware-retrieval rework (static `scroll()`-based context, see cycle 6's
+notes and `webhook/route.ts:12-14`) to a separate session.
+
+### Fixed this cycle
+- **Crawl content quality — wrong "main content" extracted, junk stored.**
+  User's own diagnosis, confirmed in code: `extractCleanText`'s hand-picked
+  selector list (`main, article, .content, #content, ...`) misses most
+  real-world layouts and fell back to the entire `<body>` far more than
+  intended, pulling in related-posts widgets, comments, newsletter forms,
+  social-share blocks, etc. that the removal selectors didn't catch. Replaced
+  the primary extraction path with **Mozilla's Readability** (the library
+  behind Firefox reader mode — purpose-built for "find the article, discard
+  chrome"), parsed via `jsdom` off the already-Playwright-rendered HTML.
+  The old Cheerio heuristic is kept as a fallback (renamed
+  `extractCleanTextCheerio`) for pages Readability can't confidently parse
+  (homepages, dashboards, non-article layouts), now widened with more junk
+  selectors (`related`, `comment`, `widget`, `social`, `share`, `newsletter`,
+  `testimonial`, `cta-`, forms, buttons) and picking the **largest** matching
+  content candidate instead of the first DOM match. New deps:
+  `@mozilla/readability`, `jsdom` (+ `@types/jsdom`), both server-only,
+  dynamically imported inside the Inngest crawl step — no client bundle
+  impact (confirmed via `next build` output, no new client route weight).
+  [src/utils/web-crawler.ts]
+- **Crawl wasting budget on non-content pages.** The crawler previously
+  followed *any* same-origin link. Added `isLikelyContentUrl` — skips login/
+  signup/cart/checkout/account, privacy/terms/cookie, tag/category archives,
+  numbered pagination, feeds, and non-HTML asset links (pdf/zip/images/css/
+  js/etc.) *before* navigating to them, so `maxPages` slots go to actual
+  content instead of boilerplate. Also fixed a real duplicate-crawl bug:
+  links were deduped by full URL including the `#fragment`, so
+  `/page#section-a` and `/page#section-b` were crawled as two "different"
+  pages — added `stripFragment` before dedup/visit tracking.
+  [src/utils/web-crawler.ts, `isLikelyContentUrl`/`stripFragment`]
+- **Crawl slow / times out.** `llmCleanContent` (the Gemini "second pass"
+  cleanup) was called **once per page, fully sequentially**, with
+  `maxPages: 10` *per seed URL* — an agent with several URLs could mean 20+
+  serial Gemini round-trips, on top of Playwright navigation. Split crawling
+  into two phases: (1) Playwright page-collection (inherently sequential,
+  one browser), producing raw cleaned text per page with no LLM call; (2) a
+  bulk LLM-cleaning pass over all collected pages using the same bounded-
+  concurrency pattern already used for embeddings (`mapWithConcurrency`,
+  concurrency 5). Also added a 3-minute wall-clock deadline
+  (`timeBudgetMs`) checked before every page/link, so one slow or hung site
+  can't blow out the whole crawl step's execution time.
+  [src/utils/web-crawler.ts, `crawlAndCleanUrls`; src/inngest/functions.ts,
+  `crawlAgentUrls`'s `"crawl"` step]
+- **Crawl content silently truncated.** `llmCleanContent` sent only the
+  first 8000 chars of a page to Gemini and **dropped everything past that**
+  — long pages (docs, changelogs, long articles) systematically lost
+  content before chunking ever ran. Now the remainder past 8000 chars is
+  appended raw instead of discarded (partial LLM polish + full raw content,
+  never partial content). [src/utils/web-crawler.ts, `llmCleanContent`]
+- **Per-page crawl failures now visible.** Previously logged and silently
+  dropped; a crawl could "succeed" while quietly missing several pages with
+  zero indication in the UI. `crawlAndCleanUrls` now returns `failedUrls`;
+  `crawlAgentUrls` writes a summary into `agents.urlsError` even on a
+  **completed** status (not just full failure), and the UI now renders that
+  as an amber note (previously `urlsError` only rendered when
+  `status === "failed"`). [src/inngest/functions.ts; src/modules/agents/ui/
+  components/agent-urls.tsx]
+- **Chat over-eager "I don't know."** `agentChatHandler`'s RAG retrieval had
+  a hard `SCORE_THRESHOLD = 0.5` cutoff — a near-miss top result (e.g. 0.46,
+  genuinely relevant but not a confident match) produced empty context and
+  a flat "I don't know" instead of an actual answer. Added a
+  `FALLBACK_FLOOR = 0.35`: if nothing clears 0.5 but the single best raw
+  result clears 0.35, use that one result alone rather than no context at
+  all. Logged (`fallback=true/false` in the existing `[rag-scores]` line) so
+  real usage data can confirm/tune both numbers later (still the same C3
+  item from cycle 5/6 — this doesn't replace that, it reduces the harm of
+  guessing at 0.5 in the meantime). [src/inngest/functions.ts,
+  `agentChatHandler`]
+
+### Not touched (explicitly deferred by user this session)
+- **Live-interview session retrieval** (`buildAgentSessionContext`,
+  `webhook/route.ts:18-48`) still does a static, non-query-aware Qdrant
+  `scroll()` — first 20 chunks in arbitrary order, capped at 6000 chars,
+  no relevance to the actual interview question. This is very likely the
+  dominant cause of "the interview agent ignores resume/JD content"
+  specifically during live sessions (as opposed to Chat, which does real
+  vector search and benefits from all the fixes above). User chose to scope
+  this session to the crawler + threshold fixes and revisit this
+  separately — it needs a real design decision (retrieve once at session
+  start using a synthesized query vs. a live tool-call for mid-conversation
+  retrieval, per the existing code comment) rather than a quick patch.
+- **Chunking strategy** (`chunkText`, paragraph/heading-based, 1000 chars +
+  200 overlap) — untouched. Feeds off cleaner input now (Readability output
+  is much less noisy than raw-body text), which should improve chunk
+  quality without changing the chunker itself; revisit only if real
+  retrieval results still look bad after this cycle's fixes land.
+- **SCORE_THRESHOLD/FALLBACK_FLOOR exact values** — still guesses, not
+  tuned against real score-distribution data (C3, still open across
+  cycles 5/6/this one).
+
+### Verification
+- **Compiled**: tsc 0 errors. `npm run build`: green, confirmed this
+  session (checked route/bundle output — no client-side weight added by
+  the new `jsdom`/`@mozilla/readability` deps, which are only reachable via
+  a dynamic `import()` inside the server-only Inngest crawl step).
+- **Not functionally exercised this session** (no live DB/Qdrant/Inngest
+  credentials). Live-env checklist:
+  1. Re-crawl an agent pointed at a real content-heavy site (blog, docs, a
+     company careers/about page with linked subpages). Compare Knowledge
+     Base chunk count and spot-check chunk text before/after — expect
+     noticeably less nav/widget/comment noise in stored chunks.
+  2. Time the crawl; for a multi-URL agent, confirm it no longer scales
+     linearly with total page count the way fully-serial Gemini calls did.
+  3. Crawl a site with a login page, tag pages, or paginated archive linked
+     from the seed page — confirm those don't appear as separately-crawled
+     pages (check the `pages` count / stored chunk sources).
+  4. In Chat, ask a question whose answer is a near-miss on relevance —
+     confirm it's answered instead of "I don't know", and check server logs
+     for `[rag-scores] ... fallback=true` on that request.
+  5. Trigger a crawl where one seed URL is unreachable and another isn't —
+     confirm the agent still reaches `completed` (not `failed`) with an
+     amber "N page(s) failed" note in the Knowledge Base panel.
+
+---
+
 ## Cycle 6 — Stuck-forever states + a missed authz gap — 2026-08-03
 ### Scope
 Full 4-role sweep (bugs/features/perf) per the standing audit process, with

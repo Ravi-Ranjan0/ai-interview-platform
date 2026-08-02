@@ -111,6 +111,9 @@ export const AgentUrls = ({ agentId }: Props) => {
       {status === "failed" && agent.urlsError && (
         <p className="text-xs text-red-600">Last crawl failed: {agent.urlsError}</p>
       )}
+      {status === "completed" && agent.urlsError && (
+        <p className="text-xs text-amber-600">{agent.urlsError}</p>
+      )}
       {lastAt && (
         <p className="text-xs text-muted-foreground">
           Last crawled{" "}

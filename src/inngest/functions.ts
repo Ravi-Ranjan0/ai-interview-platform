@@ -460,16 +460,29 @@ export const agentChatHandler = inngest.createFunction(
         });
 
         const SCORE_THRESHOLD = 0.5;
-        const searchResults = rawResults
+        // Below the main threshold there's still a "probably relevant, just
+        // not a confident match" band. A hard cutoff at 0.5 was answering
+        // "I don't know" even when the single best hit was a near-miss (e.g.
+        // 0.46) instead of actually irrelevant — fall back to the top match
+        // alone if it clears this lower floor, rather than dropping context
+        // entirely.
+        const FALLBACK_FLOOR = 0.35;
+        let searchResults = rawResults
           .filter((r) => (r.score ?? 0) >= SCORE_THRESHOLD)
           .slice(0, 5);
+        let usedFallback = false;
+
+        if (searchResults.length === 0 && (rawResults[0]?.score ?? 0) >= FALLBACK_FLOOR) {
+          searchResults = rawResults.slice(0, 1);
+          usedFallback = true;
+        }
 
         // One structured line per chat request. Grep `[rag-scores]` in prod
         // logs to build a score-distribution histogram before tuning.
         console.log(
           `[rag-scores] agent=${agentId} threshold=${SCORE_THRESHOLD} ` +
             `raw=${JSON.stringify(rawResults.map((r) => Number((r.score ?? 0).toFixed(3))))} ` +
-            `kept=${searchResults.length}`
+            `kept=${searchResults.length} fallback=${usedFallback}`
         );
 
         if (searchResults.length === 0) return { context: "", sources: [], error: null };
@@ -718,22 +731,24 @@ export const crawlAgentUrls = inngest.createFunction(
       }
     });
 
-    // Crawl. Playwright + per-page Gemini cleanup happen here in the
-    // background, not in a tRPC mutation (was A10).
-    const allPages = await step.run("crawl", async () => {
+    // Crawl. Playwright navigation stays sequential (one browser instance),
+    // but per-page Gemini cleanup now runs with bounded concurrency instead
+    // of one call at a time, and a wall-clock budget keeps a slow/hung site
+    // from blowing out the whole step's execution time.
+    const { allPages, failedUrls } = await step.run("crawl", async () => {
       const { chromium } = await import("playwright");
-      const { crawlWebsitePlaywright } = await import("@/utils/web-crawler");
-      const pages: { url: string; text: string }[] = [];
-      const visitedUrls = new Set<string>();
+      const { crawlAndCleanUrls } = await import("@/utils/web-crawler");
       const browser = await chromium.launch({ headless: true });
       try {
-        for (const url of urls) {
-          await crawlWebsitePlaywright(url, pages, browser, 3, 0, visitedUrls, 10);
-        }
+        const { pages, failedUrls } = await crawlAndCleanUrls(urls, browser, {
+          maxDepth: 3,
+          maxPagesPerUrl: 10,
+          timeBudgetMs: 3 * 60 * 1000,
+        });
+        return { allPages: pages, failedUrls };
       } finally {
         await browser.close().catch(() => {});
       }
-      return pages;
     });
 
     if (allPages.length === 0) {
@@ -742,7 +757,9 @@ export const crawlAgentUrls = inngest.createFunction(
           .update(agents)
           .set({
             urlsStatus: "failed",
-            urlsError: "No content extracted from provided URLs",
+            urlsError: failedUrls.length > 0
+              ? `No content extracted. Failed URLs: ${failedUrls.join(", ")}`
+              : "No content extracted from provided URLs",
             urlsUpdatedAt: new Date(),
             updatedAt: new Date(),
           })
@@ -757,17 +774,23 @@ export const crawlAgentUrls = inngest.createFunction(
       data: { agentId, pages: allPages, url: urls[0] },
     });
 
+    // Partial failures don't block completion (some pages/URLs still made it
+    // in), but they're surfaced via urlsError so the gap is visible instead
+    // of silently missing content.
     await step.run("mark-completed", async () => {
       await db
         .update(agents)
         .set({
           urlsStatus: "completed",
+          urlsError: failedUrls.length > 0
+            ? `${failedUrls.length} page(s) failed to crawl and were skipped: ${failedUrls.join(", ")}`
+            : null,
           urlsUpdatedAt: new Date(),
           updatedAt: new Date(),
         })
         .where(eq(agents.id, agentId));
     });
 
-    return { success: true, pagesCrawled: allPages.length };
+    return { success: true, pagesCrawled: allPages.length, failedUrls: failedUrls.length };
   }
 );
