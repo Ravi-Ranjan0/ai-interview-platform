@@ -168,6 +168,8 @@ export const meetingsRouter = createTRPCRouter({
 
     update: protectedProcedure.input(meetingsUpdateSchema)
         .mutation(async ({ input, ctx }) => {
+            await assertAgentOwned(input.agentId, ctx.auth.user.id);
+
             const [updatedMeeting] = await db
                 .update(meetings)
                 .set({

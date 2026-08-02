@@ -1,4 +1,4 @@
-import { pgTable, text, timestamp, boolean, integer, pgEnum, AnyPgColumn } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, boolean, integer, pgEnum, AnyPgColumn, index } from "drizzle-orm/pg-core";
 import { nanoid } from "nanoid";
 
 export const user = pgTable("user", {
@@ -20,7 +20,9 @@ export const session = pgTable("session", {
   ipAddress: text('ip_address'),
   userAgent: text('user_agent'),
   userId: text('user_id').notNull().references(()=> user.id, { onDelete: 'cascade' })
-});
+}, (table) => [
+  index("session_user_id_idx").on(table.userId),
+]);
 
 
 export const account = pgTable("account", {
@@ -37,7 +39,9 @@ export const account = pgTable("account", {
   password: text('password'),
   createdAt: timestamp('created_at').notNull(),
   updatedAt: timestamp('updated_at').notNull()
-});
+}, (table) => [
+  index("account_user_id_idx").on(table.userId),
+]);
 
 export const verification = pgTable("verification", {
   id: text('id').primaryKey(),
@@ -68,7 +72,9 @@ export const agents = pgTable("agents", {
   lastResponse: text('last_response'),
   createdAt: timestamp('created_at').notNull().defaultNow(),
   updatedAt: timestamp('updated_at').notNull().defaultNow(),
-});
+}, (table) => [
+  index("agents_user_id_idx").on(table.userId),
+]);
 
 
 export const meetingStatus = pgEnum("meeting_status", ["upcoming","active", "processing", "completed", "cancelled"]);
@@ -86,7 +92,11 @@ export const meetings = pgTable("meetings", {
   summary: text('summary'),
   createdAt: timestamp('created_at').notNull().defaultNow(),
   updatedAt: timestamp('updated_at').notNull().defaultNow(),
-});
+}, (table) => [
+  index("meetings_user_id_idx").on(table.userId),
+  index("meetings_agent_id_idx").on(table.agentId),
+  index("meetings_status_idx").on(table.status),
+]);
 
 export const conversations = pgTable("conversations", {
   id: text('id').primaryKey().$defaultFn(() => nanoid()),
@@ -95,7 +105,10 @@ export const conversations = pgTable("conversations", {
   agentId: text('agent_id').notNull().references(() => agents.id, { onDelete: 'cascade' }),
   createdAt: timestamp('created_at').notNull().defaultNow(),
   updatedAt: timestamp('updated_at').notNull().defaultNow(),
-});
+}, (table) => [
+  index("conversations_user_id_idx").on(table.userId),
+  index("conversations_agent_id_idx").on(table.agentId),
+]);
 
 export const messages = pgTable("messages", {
   id: text('id').primaryKey().$defaultFn(() => nanoid()),
@@ -105,7 +118,10 @@ export const messages = pgTable("messages", {
   content: text('content').notNull(),
   metadata: text('metadata'), // JSON string; agent replies carry retrieval sources for debug/test UIs
   createdAt: timestamp('created_at').notNull().defaultNow(),
-});
+}, (table) => [
+  index("messages_conversation_id_idx").on(table.conversationId),
+  index("messages_user_id_idx").on(table.userId),
+]);
 
 export const documentStatus = pgEnum("document_status", [
   "pending",
@@ -127,4 +143,8 @@ export const documents = pgTable("documents", {
   error: text('error'),
   createdAt: timestamp('created_at').notNull().defaultNow(),
   updatedAt: timestamp('updated_at').notNull().defaultNow(),
-});
+}, (table) => [
+  index("documents_agent_id_idx").on(table.agentId),
+  index("documents_user_id_idx").on(table.userId),
+  index("documents_status_idx").on(table.status),
+]);

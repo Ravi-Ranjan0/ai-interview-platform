@@ -20,19 +20,26 @@ export async function ensureAgentCollection() {
       (info as any).config?.params?.vectors?.size ??
       null;
 
-    if (currentVectorSize === null) {
-      console.warn(
-        `Could not determine vector size for 'agents' collection, recreating with size ${VECTOR_SIZE}`
+    if (currentVectorSize !== null && currentVectorSize !== VECTOR_SIZE) {
+      // Every agent's vectors live in this one collection. Auto-deleting it
+      // on a size mismatch (e.g. an embedding model swap) would silently wipe
+      // every agent's knowledge base platform-wide. Require a deliberate
+      // migration instead of a silent nuke.
+      throw new Error(
+        `Qdrant collection 'agents' has vector size ${currentVectorSize}, but the ` +
+          `configured embedding model needs ${VECTOR_SIZE}. Refusing to auto-recreate ` +
+          `(this would delete every agent's vectors). Migrate or drop the collection ` +
+          `manually, then retry.`
       );
-      await qdrant.deleteCollection("agents");
-    } else if (currentVectorSize !== VECTOR_SIZE) {
-      console.warn(
-        `Recreating 'agents' collection: found size ${currentVectorSize}, need ${VECTOR_SIZE}`
-      );
-      await qdrant.deleteCollection("agents");
-    } else {
-      return;
     }
+
+    if (currentVectorSize === VECTOR_SIZE) return;
+
+    console.warn(
+      `Could not determine vector size for 'agents' collection; leaving it as-is ` +
+        `and assuming it already matches size ${VECTOR_SIZE}.`
+    );
+    return;
   }
 
   await qdrant.createCollection("agents", {

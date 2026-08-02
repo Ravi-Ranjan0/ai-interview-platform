@@ -1,5 +1,286 @@
 # Audit Log
 
+## Cycle 6 — Stuck-forever states + a missed authz gap — 2026-08-03
+### Scope
+Full 4-role sweep (bugs/features/perf) per the standing audit process, with
+the in-flight document pipeline treated as critical path per plan. Ran tsc
+(0 errors, matches last known-green baseline) and `next build` (green,
+confirmed this cycle). `next lint` has no committed ESLint config in this
+repo — `next lint` drops into the interactive "how would you like to
+configure ESLint" wizard rather than running; not exercised, flagged below
+as a gap rather than silently skipped.
+
+### Fixed this cycle
+- **G3 — `meetings.update` accepted a client-supplied `agentId` with no
+  ownership check.** Same class as G1/G2 (cycle 3), missed there because
+  cycle 3's sweep covered `create` mutations but not `update`. Reused
+  `assertAgentOwned` (already imported in the file) before the update.
+  [src/modules/meetings/server/procedures.ts:169-173] Before: a user could
+  point their own meeting's `agentId` at another user's private agent
+  (IDOR-adjacent — bounded by needing to know/guess that agent's id, since
+  ids are nanoids, not sequential). After: `NOT_FOUND` if the agent isn't
+  theirs, matching every other agentId-accepting writer.
+- **Stuck-forever state, instance 1 — `processDocumentEmbeddings`.** Only
+  the "no text extracted" branch ever set `status: "failed"`. Any other
+  failure (fetch/parse error, Gemini error, vector dimension mismatch,
+  Qdrant unreachable) threw past all `step.run` calls; after Inngest's
+  retries exhausted, the document was left at `status: "processing"`
+  forever with no `error` set and no way for the UI to distinguish "still
+  working" from "silently dead." Wrapped steps 5-7 in try/catch; any error
+  now runs a `mark-failed` step with the caught message and returns
+  `{success:false}` instead of rethrowing (matching the existing
+  empty-text branch's pattern — a handled failure, not an Inngest retry
+  loop). [src/inngest/functions.ts, `processDocumentEmbeddings`]
+- **Stuck-forever state, instance 2 — `agentChatHandler`.** The final LLM
+  call (`instructionOnlyAgent.run(prompt)`, intentionally left outside
+  `step.run` as agent-kit doesn't support nested steps) had no catch. A
+  transient Gemini error meant no agent-reply row was ever written; the
+  chat UI polls `getMessages` while the last message is the user's
+  (`agent-chat.tsx:130-131,172`) with no timeout, so the user saw the
+  typing indicator spin forever with no error, no retry, no recovery short
+  of leaving the page. Wrapped the call; on failure it now saves a fallback
+  reply ("Sorry, I couldn't generate a reply just now...") with an
+  `llmError` field in metadata (same shape as the existing `retrievalError`
+  field from N1/cycle 4) so polling always terminates. UI not changed to
+  render `llmError` specially — the fallback message content itself is
+  sufficient signal; parseMeta already ignores unknown metadata keys
+  harmlessly. [src/inngest/functions.ts, `agentChatHandler`]
+- **A8 — Qdrant collection auto-recreate on dimension mismatch, closed.**
+  `ensureAgentCollection` used to silently `deleteCollection` + recreate
+  whenever the detected vector size didn't match (or couldn't be
+  determined) — since every agent's vectors share one `agents` collection,
+  this is a platform-wide, irreversible wipe triggered by e.g. an embedding
+  model config change or a fragile `(info as any).vectors?.size` detection
+  path missing a field Qdrant's API happens to nest differently. Changed to:
+  real mismatch → throw a descriptive error requiring manual migration;
+  undetectable size → warn and assume it's fine (don't nuke on ambiguous
+  data); matches size → no-op. A genuine dimension migration is now a
+  deliberate ops action, never an automatic side effect of a request.
+  [src/lib/qdrant.ts, `ensureAgentCollection`]
+- **A12/A13 — missing DB indexes, closed.** Zero `index()` calls existed
+  anywhere in `schema.ts`; every FK and every `status`/`userId`/`agentId`
+  lookup relied on a full scan of the PK. Added indexes on `session.userId`,
+  `account.userId`, `agents.userId`, `meetings.{userId,agentId,status}`,
+  `conversations.{userId,agentId}`, `messages.{conversationId,userId}`,
+  `documents.{agentId,userId,status}`. Additive, no behavior change.
+  [src/db/schema.ts] This repo has no `drizzle/` migration history (schema
+  changes are applied via `db:push`, not `generate`+`migrate` — confirmed
+  by running `drizzle-kit generate`, which tried to emit a from-scratch
+  `0000_*.sql` baseline rather than an index-only diff; deleted, not
+  committed). **Requires `npm run db:push`** to actually apply, same as
+  every prior schema change in this log — not exercised this session (no
+  DB credentials).
+
+### Verified but not touched this cycle (see Thinker/Decision-Maker below
+for the full reasoning)
+- **N6 — `meetingsProcessing` / `generateAgentQuestions` have the same
+  unstepped-LLM-call gap** as `agentChatHandler` did. `summarizer.run()`
+  (meetings) and `questionGenerator.run()` (agent questions) are both
+  raw, uncaught calls. For `generateAgentQuestions` the blast radius is
+  low (no polling UI blocks on `agents.lastResponse`). For
+  `meetingsProcessing` it's real: `meetingStatus` enum has no `"failed"`
+  value at all (`upcoming|active|processing|completed|cancelled`), so
+  fixing this properly needs a schema change, not just a try/catch — out
+  of scope for this cycle's "small" bar. **Next-cycle candidate.**
+- **Orphaned Qdrant vectors on agent cascade-delete.** `documents.remove`
+  does clean up Qdrant (best-effort, already logged as accepted risk in
+  earlier cycles), but deleting an **agent** cascades its `documents` rows
+  in Postgres with no corresponding Qdrant cleanup hook — those vectors
+  leak permanently. Distinct from the already-tracked "best-effort delete
+  can fail silently" risk. Real but not urgent (storage/cost concern, not
+  correctness) — next-cycle candidate, needs an Inngest hook on agent
+  delete or a periodic reconciliation job.
+- **`documents.create` has no idempotency key on its Inngest dispatch**
+  (unlike `meetings/processing`, which uses one). A client-side retry of
+  the mutation could double-enqueue `documents/process`, producing
+  duplicate chunks/vectors for the same file. Low severity (duplicate
+  data, not corruption) — cheap fix (`inngest.send({id: `document-process-
+  ${documentId}`, ...})`), deferred only because this cycle's bug budget
+  was already spent on higher-impact items.
+- **C3 (Qdrant threshold tuning)** — the score-logging groundwork from the
+  prior uncommitted session (`[rag-scores]` line, `functions.ts`) is still
+  present and still uncommitted alongside this cycle's changes; still
+  blocked on real production log data, unchanged.
+- **C4/C5 (embedding.ts native rewrite, no query-embed cache), B3 (rich
+  doc status UI), item 13 (avatar consolidation)** — carried forward
+  unchanged, still deferred pending live-env verification or real usage
+  data, per every prior cycle.
+
+### Rejected
+- **Fixing `meetingsProcessing`'s unstepped LLM call in this cycle** —
+  rejected for now specifically because it requires adding `"failed"` to
+  `meetingStatus` first (a schema change), which changes the shape of this
+  cycle's fix from "wrap in try/catch" to "schema migration + try/catch +
+  verify nothing reads the enum exhaustively elsewhere." Correct call
+  next cycle, not a "small" fix this cycle.
+- **Full DB-index composite/covering-index tuning** — rejected as
+  premature. Single-column indexes address the "full scan on every FK
+  lookup" class; composite indexes should wait for real query-plan
+  evidence (`EXPLAIN`) once there's production data volume, not guessed
+  up front.
+
+### Verification
+- **Compiled**: tsc 0 errors. `npm run build`: green (confirmed this
+  session, not just carried from a prior cycle's claim).
+- **Not functionally exercised this session** (no live DB/Qdrant/Inngest
+  credentials available). Live-env checklist:
+  1. `npm run db:push` — confirm the 9 new indexes appear
+     (`\d+ meetings` etc. in psql, or check Neon's index list).
+  2. Reassign a meeting's `agentId` via a raw tRPC call to an agent owned
+     by a different user — confirm `NOT_FOUND` instead of silent success.
+  3. Temporarily break `fileUrl` (point at a 404) on a document upload —
+     confirm the document ends at `status: "failed"` with a populated
+     `error`, not stuck at `"processing"`.
+  4. Temporarily set an invalid `GEMINI_API_KEY` and send a chat message —
+     confirm a reply row still arrives ("Sorry, I couldn't generate a
+     reply...") instead of the typing indicator spinning forever.
+  5. Manually create the `agents` Qdrant collection with the wrong vector
+     size, then trigger any embed/chat path — confirm a thrown, descriptive
+     error instead of a silent collection wipe.
+
+### Trend note
+Two "stuck forever, no error surfaced" instances found this cycle
+(document processing, chat reply) are the same shape as N1/N2 from cycle
+4 (silent-failure surface) — that class was called "partially closed" in
+cycle 4's trend note, and this cycle shows it wasn't: the pattern was
+fixed at the two sites flagged then, but two *new* call sites (the LLM
+`.run()` calls themselves, as opposed to the Qdrant retrieval around them)
+had the identical gap. **Silent/stuck-failure surface should be treated as
+still-open, not closed** — a third recurrence (`meetingsProcessing`,
+already identified above as N6) is expected next cycle. Worth a shared
+`runAgentStep(fn, fallback)`-style helper once that third instance lands,
+per the existing "two instances don't justify the abstraction yet" rule
+used elsewhere in this log.
+
+The authz-gap class (G1/G2/G3) also recurred once more despite cycle 3's
+"trust boundaries closed" verdict — same root cause noted then (no
+compile-time enforcement that a new/changed writer touching a foreign id
+calls its assert), same mitigation available (there's no lint rule or
+type-level guard forcing this; it depends on the sweep catching it). If a
+4th instance appears, that's the signal to stop relying on manual sweeps
+and add a repo convention check.
+
+---
+
+## Fix — C3 score logging (prep, not tuning) — 2026-08-01
+### Scope
+C3 was flagged as "next-cycle candidate" but required real score-log
+data before any threshold could be picked. This fix adds the logging;
+tuning happens in a later session once data has been collected.
+
+### Built
+- Chat RAG handler now fetches `limit: 10` from Qdrant with no
+  `score_threshold`, then filters at 0.5 in TS. Effective behavior
+  identical (still top-5 above 0.5 in the LLM prompt). New difference:
+  we see the *pre-filter* score distribution.
+- One structured log line per chat request, greppable by prefix:
+  ```
+  [rag-scores] agent=<id> threshold=0.5 raw=[0.82,0.71,0.63,0.48,0.31,...] kept=3
+  ```
+  Aggregating these over N chat requests gives the score distribution
+  needed to answer "is 0.5 the right threshold?"
+- `SCORE_THRESHOLD` extracted to a local const so the tuning change is
+  a one-line edit later. [src/inngest/functions.ts]
+
+### Not touched
+- **Interview session context builder** in `webhook/route.ts` uses
+  `qdrant.scroll()` — no similarity scores, just grabs first 20 chunks
+  matching the agent filter up to 6KB. That's a different retrieval
+  mode with a different tuning story ("should sessions do similarity
+  vs a whole-doc dump?") — separate concern, not part of C3.
+
+### Verification
+- **Compiled**: tsc 0 errors; `npm run build` green.
+- **Functionally verifiable in prod**: after some real chat usage,
+  `grep '\[rag-scores\]' <logs>` yields the raw score arrays. Plot as
+  a histogram; pick a new threshold if the current 0.5 is cutting
+  useful chunks or admitting garbage.
+
+### Notes
+- C3 remains open but is now *unblockable* — once you have a week or
+  two of production `[rag-scores]` lines, running a one-liner (`awk` or
+  a quick script) over them produces the distribution needed to tune.
+- Deferred items unchanged. Nothing new added.
+
+---
+
+## Fix — N5 env validation at boot — 2026-08-01
+### Scope
+Not an audit cycle. Direct fix of the N5 item flagged in cycle 4 as the
+next-cycle candidate, picked over C3 (which needs live score-log data
+before it can be tuned). One-shot: shared env schemas, swap all direct
+`process.env.X!` reads, fail fast at module load.
+
+### Built
+- **`src/lib/env.ts`** — server env, Zod-validated at module load,
+  guarded by `import "server-only"`. Required: `DATABASE_URL`,
+  `BETTER_AUTH_SECRET`, `GEMINI_API_KEY`, `OPENAI_API_KEY`,
+  `STREAM_VIDEO_SECRET_KEY`, `QDRANT_URL`. Optional: `BETTER_AUTH_URL`,
+  `QDRANT_API_KEY`, `GITHUB_CLIENT_{ID,SECRET}`,
+  `GOOGLE_CLIENT_{ID,SECRET}` (OAuth is optional; missing → that
+  provider gets disabled, app boots).
+- **`src/lib/env.public.ts`** — public env for client + server.
+  Required: `NEXT_PUBLIC_STREAM_VIDEO_API_KEY`. Optional:
+  `NEXT_PUBLIC_APP_URL`. Explicit per-key reads so Next's build-time
+  inlining works on the client (a spread of `process.env` would be
+  `undefined` there).
+- Swapped all 8 direct `process.env.X!` reads to typed `env.X` /
+  `publicEnv.X`:
+    - `src/db/index.ts` (DATABASE_URL)
+    - `src/lib/qdrant.ts` (QDRANT_URL, QDRANT_API_KEY)
+    - `src/lib/embedding.ts` (GEMINI_API_KEY)
+    - `src/lib/stream-video.ts` (STREAM_VIDEO_SECRET_KEY,
+      NEXT_PUBLIC_STREAM_VIDEO_API_KEY)
+    - `src/utils/web-crawler.ts` (GEMINI_API_KEY)
+    - `src/app/api/webhook/route.ts` (OPENAI_API_KEY)
+    - `src/inngest/functions.ts` (GEMINI_API_KEY × 3 in agent-kit calls)
+    - `src/modules/call/ui/components/call-connect.tsx`
+      (NEXT_PUBLIC_STREAM_VIDEO_API_KEY via publicEnv)
+- **Left as-is**: `src/lib/auth.ts` still reads `GITHUB_CLIENT_*` and
+  `GOOGLE_CLIENT_*` directly via `as string` casts. Those are consumed
+  by better-auth's OAuth setup — env.ts flags them as optional so a
+  missing OAuth provider doesn't crash boot, but the direct reads inside
+  auth.ts are fine because they're internal to better-auth's config.
+
+### Failure semantics
+Before: `process.env.X!` — undefined at runtime silently coerced to
+`undefined`, downstream libraries throw with confusing messages ("apiKey
+must be a string", "invalid URL", etc.), sometimes only on first request
+to a specific route.
+
+After: process refuses to start. Boot-time error names every missing var
+in one message. Example:
+```
+Invalid server environment variables:
+  QDRANT_URL: Required
+  GEMINI_API_KEY: Required
+Copy .env.example to .env and fill in the missing values.
+```
+
+### Verification
+- **Compiled**: tsc 0 errors; `npm run build` green.
+- **Functionally verifiable locally**: temporarily comment
+  `QDRANT_URL=` in `.env`, run `npm run dev`, confirm boot fails with
+  the field-level error. NOT exercised this session.
+
+### Notes for next cycle
+- Trend note carried from cycle 5: audit cadence should pause. This fix
+  was targeted, not a scheduled cycle — Phase 3 of the plan discussed
+  before this ran.
+- Next moves per the plan: shift to trigger-only audit, use bandwidth
+  for feature work or (once real score logs exist) C3 Qdrant threshold
+  tuning.
+- Deferred items still open (unchanged by this fix):
+  - Cycle 2.5 items 4 (embedding rewrite), 13 (avatar consolidation)
+  - A8 (Qdrant collection wipe on dim mismatch)
+  - A12, A13 (missing DB indexes)
+  - A16 (crawler telemetry)
+  - B3 (rich doc status UI)
+  - C3 (Qdrant threshold tuning — needs score logs)
+  - C4/C5 (pdf memory, no query embed cache)
+
+---
+
 ## Cycle 5 — External-boundary type safety — 2026-08-01
 ### Scope
 New class per cycle-4 trend note. Focus: untyped casts at external

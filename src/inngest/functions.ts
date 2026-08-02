@@ -446,16 +446,31 @@ export const agentChatHandler = inngest.createFunction(
       try {
         const queryVector = await geminiEmbeddings.embedQuery(content);
 
-        const searchResults = await qdrant.search("agents", {
+        // Fetch a wider window than we'll actually use, so [rag-scores] logs
+        // show what got filtered out — needed to tune SCORE_THRESHOLD (C3).
+        // Keep the effective behavior identical: filter in TS at 0.5.
+        const rawResults = await qdrant.search("agents", {
           vector: queryVector,
-          limit: 5,
+          limit: 10,
           filter: {
             must: [
               { key: "agentId", match: { value: agentId } },
             ],
           },
-          score_threshold: 0.5,
         });
+
+        const SCORE_THRESHOLD = 0.5;
+        const searchResults = rawResults
+          .filter((r) => (r.score ?? 0) >= SCORE_THRESHOLD)
+          .slice(0, 5);
+
+        // One structured line per chat request. Grep `[rag-scores]` in prod
+        // logs to build a score-distribution histogram before tuning.
+        console.log(
+          `[rag-scores] agent=${agentId} threshold=${SCORE_THRESHOLD} ` +
+            `raw=${JSON.stringify(rawResults.map((r) => Number((r.score ?? 0).toFixed(3))))} ` +
+            `kept=${searchResults.length}`
+        );
 
         if (searchResults.length === 0) return { context: "", sources: [], error: null };
 
@@ -510,17 +525,29 @@ USER QUESTION:
 ${content}
 `.trim();
 
-    // DO NOT wrap this in step.run to avoid nested steps
-    const { output } = await instructionOnlyAgent.run(prompt);
-    const reply = (output[0] as TextMessage).content as string;
+    // DO NOT wrap this in step.run to avoid nested steps. An uncaught error
+    // here used to fail the whole function with no reply row ever written —
+    // the chat UI polls for a reply and would spin on the typing indicator
+    // forever. Catch it and persist a visible fallback instead.
+    let reply: string;
+    let llmError: string | null = null;
+    try {
+      const { output } = await instructionOnlyAgent.run(prompt);
+      reply = (output[0] as TextMessage).content as string;
+    } catch (error) {
+      console.error("[chat-llm-failed] agent=", agentId, error);
+      llmError = error instanceof Error ? error.message : "LLM call failed";
+      reply = "Sorry, I couldn't generate a reply just now. Please try again.";
+    }
 
     // 4) Save reply. metadata carries retrieval sources for the chat UI
-    // and any future debug panels; retrievalError surfaces silent-failure
-    // regressions. Non-agent readers can ignore it.
+    // and any future debug panels; retrievalError/llmError surface silent-
+    // failure regressions. Non-agent readers can ignore it.
     await step.run("save-agent-reply", async () => {
-      const meta: { sources?: unknown[]; retrievalError?: string } = {};
+      const meta: { sources?: unknown[]; retrievalError?: string; llmError?: string } = {};
       if (retrievalSources.length > 0) meta.sources = retrievalSources;
       if (retrievalError) meta.retrievalError = retrievalError;
+      if (llmError) meta.llmError = llmError;
 
       await db.insert(messages).values({
         conversationId,
@@ -531,7 +558,7 @@ ${content}
       });
     });
 
-    return { success: true, reply };
+    return { success: !llmError, reply };
   }
 );
 
@@ -578,59 +605,75 @@ export const processDocumentEmbeddings = inngest.createFunction(
     const chunks = chunkText(parsedText);
     console.log(`Extracted ${chunks.length} chunks from ${fileName}`);
 
-    // 5) Generate embeddings
-    const vectors = await step.run("generate-embeddings", async () => {
-      return mapWithConcurrency(chunks, EMBED_CONCURRENCY, async (chunk) => {
-        const vector = await geminiEmbeddings.embedQuery(chunk.chunk);
+    // Steps 5-7 can fail for reasons unrelated to "no text extracted"
+    // (Gemini error, vector dimension mismatch, Qdrant unreachable). Without
+    // this catch, the document was left stuck at status "processing"
+    // forever once Inngest's retries were exhausted, with no error surfaced.
+    try {
+      // 5) Generate embeddings
+      const vectors = await step.run("generate-embeddings", async () => {
+        return mapWithConcurrency(chunks, EMBED_CONCURRENCY, async (chunk) => {
+          const vector = await geminiEmbeddings.embedQuery(chunk.chunk);
 
-        if (vector.length !== VECTOR_SIZE) {
-          throw new Error(
-            `Vector dimension mismatch! Expected ${VECTOR_SIZE}, got ${vector.length}`
-          );
-        }
+          if (vector.length !== VECTOR_SIZE) {
+            throw new Error(
+              `Vector dimension mismatch! Expected ${VECTOR_SIZE}, got ${vector.length}`
+            );
+          }
 
-        return {
-          id: randomUUID(),
-          vector,
-          payload: {
-            agentId,
-            documentId,
-            fileName,
-            source: fileName,
-            section: chunk.heading,
-            text: chunk.chunk,
-            chunkIndex: chunk.index,
-          },
-        };
+          return {
+            id: randomUUID(),
+            vector,
+            payload: {
+              agentId,
+              documentId,
+              fileName,
+              source: fileName,
+              section: chunk.heading,
+              text: chunk.chunk,
+              chunkIndex: chunk.index,
+            },
+          };
+        });
       });
-    });
 
-    // 6) Store in Qdrant
-    await step.run("store-embeddings", async () => {
-      await qdrant.upsert("agents", {
-        points: vectors.map(v => ({
-          id: v.id,
-          vector: v.vector,
-          payload: v.payload,
-        })),
-        wait: true,
+      // 6) Store in Qdrant
+      await step.run("store-embeddings", async () => {
+        await qdrant.upsert("agents", {
+          points: vectors.map(v => ({
+            id: v.id,
+            vector: v.vector,
+            payload: v.payload,
+          })),
+          wait: true,
+        });
       });
-    });
 
-    // 7) Update document status
-    await step.run("mark-completed", async () => {
-      await db
-        .update(documents)
-        .set({
-          status: "completed",
-          chunkCount: vectors.length,
-          updatedAt: new Date(),
-        })
-        .where(eq(documents.id, documentId));
-    });
+      // 7) Update document status
+      await step.run("mark-completed", async () => {
+        await db
+          .update(documents)
+          .set({
+            status: "completed",
+            chunkCount: vectors.length,
+            updatedAt: new Date(),
+          })
+          .where(eq(documents.id, documentId));
+      });
 
-    console.log(`Successfully processed ${fileName}: ${vectors.length} chunks stored`);
-    return { success: true, chunksProcessed: vectors.length };
+      console.log(`Successfully processed ${fileName}: ${vectors.length} chunks stored`);
+      return { success: true, chunksProcessed: vectors.length };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error during embedding";
+      console.error(`[document-process-failed] document=${documentId} agent=${agentId}: ${message}`);
+      await step.run("mark-failed", async () => {
+        await db
+          .update(documents)
+          .set({ status: "failed", error: message, updatedAt: new Date() })
+          .where(eq(documents.id, documentId));
+      });
+      return { success: false, reason: message };
+    }
   }
 );
 
