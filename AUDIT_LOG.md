@@ -1,5 +1,85 @@
 # Audit Log
 
+## Cycle 5 — External-boundary type safety — 2026-08-01
+### Scope
+New class per cycle-4 trend note. Focus: untyped casts at external
+boundaries (Inngest event payloads, Qdrant `payload as`, webhook `payload
+as CallXEvent`), plus loose Zod inputs on tRPC.
+
+### Fixed this cycle
+- **T2 — Inngest event schemas centralized.** New `src/inngest/events.ts`
+  exports one Zod schema per event, an `EventName` union, an
+  `EventData<K>` inference helper, and a `parseEvent(name, data)`
+  runtime validator. Every handler in `src/inngest/functions.ts` now
+  calls `parseEvent("<event>", event.data)` at entry:
+    - `meetings/processing`
+    - `agents/questions`
+    - `agents/generate-embeddings`
+    - `agents/crawl-urls`
+    - `agent/message`
+    - `documents/process`
+  Drift between a dispatcher and a handler now surfaces as a thrown
+  ZodError inside the step — Inngest's dashboard picks it up cleanly and
+  applies normal retry/backoff. Zero cast sites remain in handlers.
+- **T3 — Shared Qdrant payload type.** New `AgentVectorPayload` type
+  exported from `src/inngest/functions.ts`. Consumed by:
+    - `agentChatHandler`'s RAG retrieval (both `sources` map + context
+      builder)
+    - `webhook/route.ts` `buildAgentSessionContext`
+  Writer sites (URL + document pipelines) continue to compose the shape
+  literally; if a future writer adds/renames a field, TypeScript flags
+  the readers.
+- **T4 — Tightened `documents.create` Zod input:**
+  `fileUrl` now `.url()` (was `z.string()`); `agentId`, `fileName`,
+  `mimeType` now `.min(1)`; `fileSize` now `.int().nonnegative()`.
+  Non-URL `fileUrl` used to become a confusing `fetch` error inside
+  Inngest — now a clean 400 at the boundary. [src/modules/documents/server/procedures.ts]
+
+### Deferred (explicitly out of scope)
+- **T1 — Webhook `payload as CallXEvent` casts.** Stream is a stable
+  API; retrofitting Zod for its own sake is over-engineering. Address
+  when Stream ships a schema change or a fuzzed body starts producing
+  500s in logs.
+- **T5 — `JSON.parse(metadata) as {...}` in agent-chat.tsx.** Our own
+  data; risk is minimal.
+- **Broader Zod tightening** across every `z.string()` id / search
+  input. Cosmetic; the ones that mattered (`documents.create`) landed.
+- **Inngest typed-client migration** (`Inngest<{...}>`). Would formalize
+  what `EventSchemas` already gives us at the type level, but requires
+  touching every `inngest.send` site. YAGNI until it pays for itself.
+
+### Verification
+- **Compiled**: tsc 0 errors; `npm run build` green.
+- **Functionally exercised**: NOT this session. Live-env checklist:
+    1. Dispatch a valid event (`documents/process` via a real upload) —
+       handler runs as before.
+    2. From an Inngest test harness or a script, dispatch an event with
+       a bad shape (e.g. `documents/process` missing `mimeType`) —
+       confirm the handler fails with a ZodError visible in the Inngest
+       dashboard rather than a deeper runtime error.
+    3. Attempt `documents.create` from tRPC devtools with
+       `fileUrl: "not-a-url"` — confirm a 400 with a field-level
+       validation error, not a downstream Inngest fetch failure.
+
+### Trend note
+Cycle 5 addressed the T2/N4 recurrence (Inngest cast pattern flagged in
+cycle 4 as "watch for it") by fixing at the class level rather than site
+by site. The shared `parseEvent` + `AgentVectorPayload` are load-bearing:
+new events/writers now converge on the shared shape by construction.
+
+Cluster status across cycles:
+- Trust boundaries → closed (`assertAgentOwned`).
+- Dead code / orphan deps → closed.
+- Silent-failure surface → partially closed (chat + interview logs
+  greppable, cluster helper deferred until 3rd instance).
+- External boundary types → closed for Inngest + Qdrant this cycle.
+
+**Next candidate class:** operational readiness (env validation at
+boot; N5 still open) or performance instrumentation (Qdrant
+`score_threshold` tuning needs real score logs — C3 still open).
+
+---
+
 ## Cycle 4 — Silent-failure surface in background jobs — 2026-08-01
 ### Scope
 New class per cycle-2.6 trend note ("scan for a new class"). Focus: silent

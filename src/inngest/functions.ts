@@ -1,5 +1,7 @@
 import { StreamTranscriptItem } from "@/modules/meetings/type";
 import { inngest } from "./client";
+import { parseEvent } from "./events";
+import { env } from "@/lib/env";
 import JSONL from "jsonl-parse-stringify";
 import { db } from "@/db";
 import { agents, meetings, messages, user, documents } from "@/db/schema";
@@ -9,6 +11,21 @@ import { qdrant, ensureAgentCollection } from "@/lib/qdrant";
 import { geminiEmbeddings, VECTOR_SIZE } from "@/lib/embedding";
 import { randomUUID } from "crypto";
 import stringSimilarity from "string-similarity";
+
+// Shared shape between the two writers (URL + document pipelines) and the
+// three readers (agentChatHandler retrieval, buildAgentSessionContext,
+// url-vector cleanup). Discriminator: presence of `documentId` marks a
+// document-sourced point; absence marks a URL-sourced point.
+export type AgentVectorPayload = {
+  agentId: string;
+  text: string;
+  chunkIndex: number;
+  url?: string;
+  section?: string;
+  fileName?: string;
+  documentId?: string;
+  source?: string;
+};
 
 // ponytail: 5-at-a-time cap avoids Gemini 429s on large docs. Upgrade path:
 // swap for p-limit if we ever need per-key concurrency across events.
@@ -56,7 +73,7 @@ Example:
     .trim(),
   model: gemini({
     model: "gemini-1.5-flash",
-    apiKey: process.env.GEMINI_API_KEY
+    apiKey: env.GEMINI_API_KEY,
   }),
 })
 
@@ -65,10 +82,9 @@ export const meetingsProcessing = inngest.createFunction(
   { id: "meetings-processing" },
   { event: "meetings/processing" },
   async ({ event, step }) => {
-    // Process the meeting event
-    // const response = await step.fetch(event.data.transcriptUrl);
+    const { meetingId, transcriptUrl } = parseEvent("meetings/processing", event.data);
     const response = await step.run("fetch-transcript", async () => {
-      return fetch(event.data.transcriptUrl).then((res) => res.text());
+      return fetch(transcriptUrl).then((res) => res.text());
     });
 
     const transcript = await step.run("parse-transcript", async () => {
@@ -135,7 +151,7 @@ export const meetingsProcessing = inngest.createFunction(
           summary: (output[0] as TextMessage).content as string,
           status: "completed",
         })
-        .where(eq(meetings.id, event.data.meetingId));
+        .where(eq(meetings.id, meetingId));
     });
 
   });
@@ -162,15 +178,15 @@ Take a deep breath and work on this problem step-by-step.
   `,
   model: gemini({
     model: "gemini-1.5-flash",
-    apiKey: process.env.GEMINI_API_KEY,
+    apiKey: env.GEMINI_API_KEY,
   }),
 });
 
 export const generateAgentQuestions = inngest.createFunction(
   { id: "generate-agent-questions" },
-  { event: "agents/questions" }, // ✅ Event name expects only agentId
+  { event: "agents/questions" },
   async ({ event, step }) => {
-    const { agentId } = event.data;
+    const { agentId } = parseEvent("agents/questions", event.data);
     console.log("🚀 Inngest function fired with agentId:", agentId);
 
     // Step 1: Fetch agent by ID
@@ -294,7 +310,7 @@ export const generateAndStoreEmbeddings = inngest.createFunction(
   { id: "generate-and-store-embeddings" },
   { event: "agents/generate-embeddings" },
   async ({ event, step }) => {
-    const { agentId, pages } = event.data as { agentId: string; pages: { url: string; text: string }[] };
+    const { agentId, pages } = parseEvent("agents/generate-embeddings", event.data);
     if (!pages || pages.length === 0) {
       throw new Error("No pages provided for embeddings generation");
     }
@@ -403,7 +419,7 @@ Strict output rules:
 `.trim(),
   model: gemini({
     model: "gemini-1.5-flash",
-    apiKey: process.env.GEMINI_API_KEY,
+    apiKey: env.GEMINI_API_KEY,
   }),
 });
 
@@ -411,7 +427,7 @@ export const agentChatHandler = inngest.createFunction(
   { id: "agent-chat-handler-instruction-only" },
   { event: "agent/message" },
   async ({ event, step }) => {
-    const { agentId, conversationId, userId, content } = event.data;
+    const { agentId, conversationId, userId, content } = parseEvent("agent/message", event.data);
     console.log("agentChatHandler fired for agent:", agentId);
 
     // 1) Fetch agent record
@@ -444,12 +460,7 @@ export const agentChatHandler = inngest.createFunction(
         if (searchResults.length === 0) return { context: "", sources: [], error: null };
 
         const sources = searchResults.map((r) => {
-          const payload = r.payload as {
-            text?: string;
-            url?: string;
-            section?: string;
-            fileName?: string;
-          };
+          const payload = r.payload as Partial<AgentVectorPayload>;
           return {
             fileName: payload.fileName,
             url: payload.url,
@@ -459,14 +470,9 @@ export const agentChatHandler = inngest.createFunction(
         });
 
         const contextParts = searchResults.map((result, i) => {
-          const payload = result.payload as {
-            text: string;
-            url?: string;
-            section?: string;
-            fileName?: string;
-          };
+          const payload = result.payload as Partial<AgentVectorPayload>;
           const source = payload.url || payload.fileName || "knowledge base";
-          return `[Source ${i + 1}: ${source}${payload.section ? ` - ${payload.section}` : ""}]\n${payload.text}`;
+          return `[Source ${i + 1}: ${source}${payload.section ? ` - ${payload.section}` : ""}]\n${payload.text ?? ""}`;
         });
 
         return { context: contextParts.join("\n\n---\n\n"), sources, error: null };
@@ -533,7 +539,7 @@ export const processDocumentEmbeddings = inngest.createFunction(
   { id: "process-document-embeddings" },
   { event: "documents/process" },
   async ({ event, step }) => {
-    const { documentId, agentId, fileUrl, fileName, mimeType } = event.data;
+    const { documentId, agentId, fileUrl, fileName, mimeType } = parseEvent("documents/process", event.data);
 
     console.log(`Processing document: ${fileName} for agent: ${agentId}`);
     await ensureAgentCollection();
@@ -636,7 +642,7 @@ export const crawlAgentUrls = inngest.createFunction(
   { id: "agents-crawl-urls" },
   { event: "agents/crawl-urls" },
   async ({ event, step }) => {
-    const { agentId, urls } = event.data as { agentId: string; urls: string[] };
+    const { agentId, urls } = parseEvent("agents/crawl-urls", event.data);
     if (!urls || urls.length === 0) {
       return { success: false, reason: "No URLs provided" };
     }

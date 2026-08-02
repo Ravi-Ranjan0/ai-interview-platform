@@ -16,6 +16,7 @@ import { useMutation } from "@tanstack/react-query";
 import { LoaderIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 import { CallUI } from "./call-ui";
+import { publicEnv } from "@/lib/env.public";
 
 interface Props {
   meetingId: string;
@@ -39,7 +40,7 @@ export const CallConnect = ({
   const [client, setClient] = useState<StreamVideoClient>();
   useEffect(() => {
     const _client = new StreamVideoClient({
-      apiKey: process.env.NEXT_PUBLIC_STREAM_VIDEO_API_KEY!,
+      apiKey: publicEnv.NEXT_PUBLIC_STREAM_VIDEO_API_KEY,
       user: {
         id: userId,
         name: userName,

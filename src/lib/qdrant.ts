@@ -1,9 +1,10 @@
 import { QdrantClient } from "@qdrant/js-client-rest";
 import { VECTOR_SIZE } from "./embedding";
+import { env } from "./env";
 
 export const qdrant = new QdrantClient({
-  url: process.env.QDRANT_URL!,
-  apiKey: process.env.QDRANT_API_KEY,
+  url: env.QDRANT_URL,
+  apiKey: env.QDRANT_API_KEY,
 });
 
 export async function ensureAgentCollection() {

@@ -6,6 +6,8 @@ import { CallEndedEvent, CallRecordingReadyEvent, CallSessionParticipantLeftEven
 import { and, eq, not } from "drizzle-orm";
 import { NextRequest, NextResponse } from "next/server";
 import { qdrant } from "@/lib/qdrant";
+import type { AgentVectorPayload } from "@/inngest/functions";
+import { env } from "@/lib/env";
 
 // ponytail: static per-session RAG context — pull top-K agent-scoped chunks
 // with no query filter and inline them into the instructions. Upgrade path:
@@ -26,12 +28,7 @@ async function buildAgentSessionContext(agentId: string): Promise<string> {
         let total = 0;
         const parts: string[] = [];
         for (const p of points) {
-            const payload = p.payload as {
-                text?: string;
-                url?: string;
-                fileName?: string;
-                section?: string;
-            } | null;
+            const payload = p.payload as Partial<AgentVectorPayload> | null;
             const text = payload?.text?.trim();
             if (!text) continue;
             const source = payload?.fileName ?? payload?.url ?? "knowledge base";
@@ -122,7 +119,7 @@ export async function POST(req: NextRequest) {
 
         const realTimeClient = await streamVideo.video.connectOpenAi({
             call,
-            openAiApiKey: process.env.OPENAI_API_KEY!,
+            openAiApiKey: env.OPENAI_API_KEY,
             agentUserId: existingAgent.id,
         });
 

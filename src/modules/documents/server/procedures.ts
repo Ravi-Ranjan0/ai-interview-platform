@@ -11,11 +11,11 @@ import { assertAgentOwned } from "@/lib/authz";
 export const documentsRouter = createTRPCRouter({
   create: protectedProcedure
     .input(z.object({
-      agentId: z.string(),
-      fileName: z.string(),
-      fileUrl: z.string(),
-      fileSize: z.number().optional(),
-      mimeType: z.string(),
+      agentId: z.string().min(1),
+      fileName: z.string().min(1),
+      fileUrl: z.string().url(),
+      fileSize: z.number().int().nonnegative().optional(),
+      mimeType: z.string().min(1),
     }))
     .mutation(async ({ ctx, input }) => {
       await assertAgentOwned(input.agentId, ctx.auth.user.id);
