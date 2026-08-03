@@ -1,4 +1,4 @@
-import { pgTable, text, timestamp, boolean, integer, pgEnum, AnyPgColumn, index } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, boolean, integer, pgEnum, AnyPgColumn, index, uniqueIndex } from "drizzle-orm/pg-core";
 import { nanoid } from "nanoid";
 
 export const user = pgTable("user", {
@@ -147,4 +147,80 @@ export const documents = pgTable("documents", {
   index("documents_agent_id_idx").on(table.agentId),
   index("documents_user_id_idx").on(table.userId),
   index("documents_status_idx").on(table.status),
+]);
+
+export const roomStatus = pgEnum("room_status", ["open", "scheduled", "completed", "cancelled"]);
+
+export const rooms = pgTable("rooms", {
+  id: text('id').primaryKey().$defaultFn(() => nanoid()),
+  topic: text('topic').notNull(),
+  createdBy: text('created_by').notNull().references(() => user.id, { onDelete: 'cascade' }),
+  status: roomStatus('status').notNull().default("open"),
+  scheduledAt: timestamp('scheduled_at'),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+  updatedAt: timestamp('updated_at').notNull().defaultNow(),
+}, (table) => [
+  index("rooms_status_idx").on(table.status),
+  index("rooms_created_by_idx").on(table.createdBy),
+]);
+
+export const roomMembers = pgTable("room_members", {
+  id: text('id').primaryKey().$defaultFn(() => nanoid()),
+  roomId: text('room_id').notNull().references(() => rooms.id, { onDelete: 'cascade' }),
+  userId: text('user_id').notNull().references(() => user.id, { onDelete: 'cascade' }),
+  joinedAt: timestamp('joined_at').notNull().defaultNow(),
+}, (table) => [
+  index("room_members_room_id_idx").on(table.roomId),
+  index("room_members_user_id_idx").on(table.userId),
+  uniqueIndex("room_members_room_user_uq").on(table.roomId, table.userId),
+]);
+
+export const roomMessages = pgTable("room_messages", {
+  id: text('id').primaryKey().$defaultFn(() => nanoid()),
+  roomId: text('room_id').notNull().references(() => rooms.id, { onDelete: 'cascade' }),
+  userId: text('user_id').notNull().references(() => user.id, { onDelete: 'cascade' }),
+  content: text('content').notNull(),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+}, (table) => [
+  index("room_messages_room_id_idx").on(table.roomId),
+]);
+
+export const roomTimeSlots = pgTable("room_time_slots", {
+  id: text('id').primaryKey().$defaultFn(() => nanoid()),
+  roomId: text('room_id').notNull().references(() => rooms.id, { onDelete: 'cascade' }),
+  proposedBy: text('proposed_by').notNull().references(() => user.id, { onDelete: 'cascade' }),
+  slotTime: timestamp('slot_time').notNull(),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+}, (table) => [
+  index("room_time_slots_room_id_idx").on(table.roomId),
+]);
+
+export const roomTimeSlotVotes = pgTable("room_time_slot_votes", {
+  id: text('id').primaryKey().$defaultFn(() => nanoid()),
+  slotId: text('slot_id').notNull().references(() => roomTimeSlots.id, { onDelete: 'cascade' }),
+  roomId: text('room_id').notNull().references(() => rooms.id, { onDelete: 'cascade' }),
+  userId: text('user_id').notNull().references(() => user.id, { onDelete: 'cascade' }),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+}, (table) => [
+  index("room_time_slot_votes_slot_id_idx").on(table.slotId),
+  uniqueIndex("room_time_slot_votes_room_user_uq").on(table.roomId, table.userId),
+]);
+
+export const roomCompletions = pgTable("room_completions", {
+  id: text('id').primaryKey().$defaultFn(() => nanoid()),
+  roomId: text('room_id').notNull().references(() => rooms.id, { onDelete: 'cascade' }),
+  userId: text('user_id').notNull().references(() => user.id, { onDelete: 'cascade' }),
+  completedAt: timestamp('completed_at').notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("room_completions_room_user_uq").on(table.roomId, table.userId),
+]);
+
+export const roomBonusAwards = pgTable("room_bonus_awards", {
+  id: text('id').primaryKey().$defaultFn(() => nanoid()),
+  roomId: text('room_id').notNull().references(() => rooms.id, { onDelete: 'cascade' }),
+  userId: text('user_id').notNull().references(() => user.id, { onDelete: 'cascade' }),
+  points: integer('points').notNull(),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+}, (table) => [
+  index("room_bonus_awards_user_id_idx").on(table.userId),
 ]);

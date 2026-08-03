@@ -1,6 +1,6 @@
 import "server-only";
 import { db } from "@/db";
-import { agents } from "@/db/schema";
+import { agents, rooms, roomMembers } from "@/db/schema";
 import { and, eq } from "drizzle-orm";
 import { TRPCError } from "@trpc/server";
 
@@ -15,5 +15,19 @@ export async function assertAgentOwned(agentId: string, userId: string): Promise
     .where(and(eq(agents.id, agentId), eq(agents.userId, userId)));
   if (!row) {
     throw new TRPCError({ code: "NOT_FOUND", message: "Agent not found." });
+  }
+}
+
+export async function assertRoomMember(roomId: string, userId: string): Promise<void> {
+  const [room] = await db.select({ id: rooms.id }).from(rooms).where(eq(rooms.id, roomId));
+  if (!room) {
+    throw new TRPCError({ code: "NOT_FOUND", message: "Room not found." });
+  }
+  const [membership] = await db
+    .select({ id: roomMembers.id })
+    .from(roomMembers)
+    .where(and(eq(roomMembers.roomId, roomId), eq(roomMembers.userId, userId)));
+  if (!membership) {
+    throw new TRPCError({ code: "FORBIDDEN", message: "You are not a member of this room." });
   }
 }
