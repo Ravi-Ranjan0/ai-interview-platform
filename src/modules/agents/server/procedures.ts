@@ -4,7 +4,7 @@ import { createTRPCRouter, protectedProcedure } from "@/trpc/init";
 import { agentsInsertSchema, agentsUpdateSchema } from "../schema";
 import z from "zod";
 import { eq, getTableColumns, count, sql, and, ilike, desc } from "drizzle-orm";
-import { DEFAULT_PAGE, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "@/constant";
+import { DEFAULT_PAGE, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, QUIZ_INITIAL_BANK_SIZE } from "@/constant";
 import { TRPCError } from "@trpc/server";
 import { inngest } from "@/inngest/client";
 import { assertAgentOwned } from "@/lib/authz";
@@ -70,7 +70,6 @@ export const agentsRouter = createTRPCRouter({
             const [existingAgent] = await db
                 .select({
                     meetingCount: sql<number>`(SELECT COUNT(*)::int FROM ${meetings} WHERE ${meetings.agentId} = ${agents.id})`,
-                    last_Response: agents.lastResponse,
                     ...getTableColumns(agents),
                 })
                 .from(agents)
@@ -166,8 +165,8 @@ export const agentsRouter = createTRPCRouter({
             }
 
             await inngest.send({
-                name: "agents/questions",
-                data: { agentId: createdAgent.id },
+                name: "agents/generate-quiz-questions",
+                data: { agentId: createdAgent.id, count: QUIZ_INITIAL_BANK_SIZE },
             });
 
             return createdAgent;

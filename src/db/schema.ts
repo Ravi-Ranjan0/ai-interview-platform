@@ -69,7 +69,6 @@ export const agents = pgTable("agents", {
   urlsStatus: urlsStatus('urls_status').notNull().default("idle"),
   urlsUpdatedAt: timestamp('urls_updated_at'),
   urlsError: text('urls_error'),
-  lastResponse: text('last_response'),
   createdAt: timestamp('created_at').notNull().defaultNow(),
   updatedAt: timestamp('updated_at').notNull().defaultNow(),
 }, (table) => [
@@ -224,4 +223,52 @@ export const roomBonusAwards = pgTable("room_bonus_awards", {
   createdAt: timestamp('created_at').notNull().defaultNow(),
 }, (table) => [
   index("room_bonus_awards_user_id_idx").on(table.userId),
+]);
+
+// Pre-interview quiz: a bank of candidate-background questions per agent,
+// picked (never-used first, then oldest-used) into timed attempts. Answers
+// are graded and embedded into Qdrant (candidateId-scoped) so the live
+// interviewer can retrieve them mid-conversation. See src/modules/quiz.
+
+export const quizQuestions = pgTable("quiz_questions", {
+  id: text('id').primaryKey().$defaultFn(() => nanoid()),
+  agentId: text('agent_id').notNull().references(() => agents.id, { onDelete: 'cascade' }),
+  question: text('question').notNull(),
+  isActive: boolean('is_active').notNull().default(true),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+}, (table) => [
+  index("quiz_questions_agent_id_idx").on(table.agentId),
+]);
+
+export const quizAttemptStatus = pgEnum("quiz_attempt_status", ["in_progress", "completed", "expired"]);
+
+export const quizAttempts = pgTable("quiz_attempts", {
+  id: text('id').primaryKey().$defaultFn(() => nanoid()),
+  agentId: text('agent_id').notNull().references(() => agents.id, { onDelete: 'cascade' }),
+  userId: text('user_id').notNull().references(() => user.id, { onDelete: 'cascade' }),
+  status: quizAttemptStatus('status').notNull().default("in_progress"),
+  startedAt: timestamp('started_at').notNull().defaultNow(),
+  completedAt: timestamp('completed_at'),
+  expiresAt: timestamp('expires_at').notNull(),
+  overallScore: integer('overall_score'), // 0-100, set once grading finishes
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+}, (table) => [
+  index("quiz_attempts_agent_id_idx").on(table.agentId),
+  index("quiz_attempts_user_id_idx").on(table.userId),
+]);
+
+export const quizAttemptQuestions = pgTable("quiz_attempt_questions", {
+  id: text('id').primaryKey().$defaultFn(() => nanoid()),
+  quizAttemptId: text('quiz_attempt_id').notNull().references(() => quizAttempts.id, { onDelete: 'cascade' }),
+  quizQuestionId: text('quiz_question_id').notNull().references(() => quizQuestions.id, { onDelete: 'cascade' }),
+  orderIndex: integer('order_index').notNull(),
+  questionText: text('question_text').notNull(), // snapshot; survives later bank edits
+  answerText: text('answer_text'),
+  answeredAt: timestamp('answered_at'),
+  rating: integer('rating'), // 0-10, set by the grading job
+  feedback: text('feedback'),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+}, (table) => [
+  index("quiz_attempt_questions_attempt_id_idx").on(table.quizAttemptId),
+  uniqueIndex("quiz_attempt_questions_attempt_question_uq").on(table.quizAttemptId, table.quizQuestionId),
 ]);

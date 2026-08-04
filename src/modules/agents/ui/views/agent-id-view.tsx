@@ -21,6 +21,7 @@ import { KnowledgeBase } from "../components/knowledge-base";
 import { AgentChat } from "../components/agent-chat";
 import { AgentUrls } from "../components/agent-urls";
 import { Loader2Icon } from "lucide-react";
+import { QuizSummary } from "@/modules/quiz/ui/components/quiz-summary";
 
 interface Props {
   agentId: string;
@@ -84,6 +85,7 @@ export const AgentIdView = ({ agentId }: Props) => {
             <TabsTrigger value="details">Details</TabsTrigger>
             <TabsTrigger value="knowledge">Knowledge Base</TabsTrigger>
             <TabsTrigger value="chat">Chat</TabsTrigger>
+            <TabsTrigger value="quiz">Quiz</TabsTrigger>
           </TabsList>
           <TabsContent value="details">
             <div className="bg-white rounded-lg border">
@@ -127,6 +129,9 @@ export const AgentIdView = ({ agentId }: Props) => {
           </TabsContent>
           <TabsContent value="chat">
             <AgentChat agentId={agentId} agentName={data.name} />
+          </TabsContent>
+          <TabsContent value="quiz">
+            <QuizSummary agentId={agentId} />
           </TabsContent>
         </Tabs>
       </div>

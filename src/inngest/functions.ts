@@ -5,7 +5,7 @@ import { env } from "@/lib/env";
 import { ROOM_STALE_AFTER_MS } from "@/constant";
 import JSONL from "jsonl-parse-stringify";
 import { db } from "@/db";
-import { agents, meetings, messages, user, documents, rooms, roomMessages } from "@/db/schema";
+import { agents, meetings, messages, user, documents, rooms, roomMessages, quizQuestions, quizAttempts, quizAttemptQuestions } from "@/db/schema";
 import { and, eq, gte, inArray, lt, notExists } from "drizzle-orm";
 import { createAgent, gemini, TextMessage, } from "@inngest/agent-kit";
 import { qdrant, ensureAgentCollection } from "@/lib/qdrant";
@@ -26,6 +26,10 @@ export type AgentVectorPayload = {
   fileName?: string;
   documentId?: string;
   source?: string;
+  // Set only on quiz-answer-derived points (see gradeQuizAttempt below) so
+  // the live interview's retrieval tool can scope a search to one candidate
+  // while general knowledge-base chunks (no candidateId) stay visible to all.
+  candidateId?: string;
 };
 
 // ponytail: 5-at-a-time cap avoids Gemini 429s on large docs. Upgrade path:
@@ -158,83 +162,223 @@ export const meetingsProcessing = inngest.createFunction(
   });
 
 
-const questionGenerator = createAgent({
-  name: "question-generator",
+// Extracts a TextMessage's content whether it's a plain string or a
+// TextContent[] (agent-kit's two possible shapes) into a single string.
+function textMessageContent(message: TextMessage): string {
+  return typeof message.content === "string"
+    ? message.content
+    : message.content.map(c => c.text).join("\n");
+}
+
+// Best-effort JSON-array parse for LLM output that was asked to return
+// strict JSON but might wrap it in prose or a code fence anyway.
+function parseJsonArray(raw: string): unknown[] | null {
+  const match = raw.match(/\[[\s\S]*\]/);
+  if (!match) return null;
+  try {
+    const parsed = JSON.parse(match[0]);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+const quizQuestionGenerator = createAgent({
+  name: "quiz-question-generator",
   system: `
-  Act like a professional prompt-based question generator. You specialize in crafting thoughtful, relevant, and well-structured questions in response to user-provided instructions across any domain. Your only responsibility is to produce a clean list of questions that probe deeply into the subject matter the user has specified.
+You write pre-interview screening quiz questions. Given a job/role description (INSTRUCTIONS) and a list of questions that already exist for this role (EXISTING), produce new, distinct quiz questions that ask the CANDIDATE about their own background, experience, and skills relevant to the role — not trivia about the role itself.
 
-You must:
-- Generate only questions—do not include categories, titles, summaries, or explanations.
-- Ensure each question is precise, context-aware, and aligned with the user’s intent.
-- Write in a clear and professional tone, avoiding repetition, ambiguity, or overly simplistic phrasing.
-- Encourage reflection, critical thinking, or detailed responses, depending on the topic.
-- Cover different angles and cognitive levels (e.g. factual, analytical, evaluative, situational, or hypothetical).
-- Format your output strictly as a list of bullet-pointed questions without numbering, headings, or meta commentary.
-- Adapt to any type of instruction, whether it relates to science, education, psychology, business, strategy, design, writing, ethics, or others.
-
-Do not answer the questions. Do not explain your choices. Do not group or organize by theme. Simply generate a flat list of refined, standalone questions based solely on the user's instructions.
-
-Take a deep breath and work on this problem step-by-step.
-
-  `,
+Rules:
+- Ask the candidate to describe/explain/reflect on their own experience (e.g. "Describe a time you...", "What experience do you have with...", "How would you approach...").
+- Every question must be meaningfully different in substance from every question in EXISTING — do not rephrase an existing question.
+- Cover a mix of angles: technical/skills, past experience, problem-solving, behavioral, motivation.
+- Output ONLY a JSON array of strings, nothing else. No markdown fence, no commentary, no numbering.
+  `.trim(),
   model: gemini({
     model: "gemini-1.5-flash",
     apiKey: env.GEMINI_API_KEY,
   }),
 });
 
-export const generateAgentQuestions = inngest.createFunction(
-  { id: "generate-agent-questions" },
-  { event: "agents/questions" },
-  async ({ event, step }) => {
-    const { agentId } = parseEvent("agents/questions", event.data);
-    console.log("🚀 Inngest function fired with agentId:", agentId);
+const QUESTION_SIMILARITY_THRESHOLD = 0.85;
 
-    // Step 1: Fetch agent by ID
+export const generateQuizQuestionBank = inngest.createFunction(
+  { id: "generate-quiz-question-bank" },
+  { event: "agents/generate-quiz-questions" },
+  async ({ event, step }) => {
+    const { agentId, count } = parseEvent("agents/generate-quiz-questions", event.data);
+
     const agent = await step.run("fetch-agent", async () => {
+      return db.select().from(agents).where(eq(agents.id, agentId)).then(res => res[0]);
+    });
+    if (!agent) throw new Error("Agent not found");
+
+    const existing = await step.run("fetch-existing-bank", async () => {
       return db
-        .select()
-        .from(agents)
-        .where(eq(agents.id, agentId))
-        .then(res => res[0]);
+        .select({ question: quizQuestions.question })
+        .from(quizQuestions)
+        .where(and(eq(quizQuestions.agentId, agentId), eq(quizQuestions.isActive, true)));
+    });
+    const existingTexts = existing.map(q => q.question);
+
+    const generated = await step.run("generate-questions", async () => {
+      const { output } = await quizQuestionGenerator.run(
+        `INSTRUCTIONS:\n${agent.instructions}\n\n` +
+        `EXISTING (${existingTexts.length}):\n${existingTexts.map(q => `- ${q}`).join("\n") || "(none)"}\n\n` +
+        `Generate ${count} new questions.`
+      );
+      const raw = textMessageContent(output[0] as TextMessage);
+      const parsed = parseJsonArray(raw);
+      if (parsed) {
+        return parsed.filter((q): q is string => typeof q === "string" && q.trim().length > 0);
+      }
+      // Fallback: the same bullet/line splitting the old lastResponse UI used,
+      // in case the model ignores the "JSON only" instruction.
+      return raw
+        .split("\n")
+        .map(line => line.trim())
+        .filter(line => line.startsWith("*") || line.startsWith("•") || line.startsWith("-"))
+        .map(line => line.replace(/^([*•\-])\s*/, "").replace(/^"|"$/g, ""))
+        .filter(Boolean);
     });
 
-    if (!agent) {
-      throw new Error("Agent not found");
+    const deduped = await step.run("dedupe-against-existing", async () => {
+      const kept: string[] = [];
+      for (const candidate of generated) {
+        const comparisonPool = [...existingTexts, ...kept];
+        const isDuplicate = comparisonPool.some(
+          existingQ => stringSimilarity.compareTwoStrings(existingQ, candidate) > QUESTION_SIMILARITY_THRESHOLD
+        );
+        if (!isDuplicate) kept.push(candidate);
+      }
+      return kept;
+    });
+
+    if (deduped.length === 0) {
+      return { success: false, reason: "No new distinct questions generated" };
     }
 
-    // Step 2: Generate questions using instructions
-    const { output } = await questionGenerator.run(
-      `Based on the following user instructions, generate a list of thoughtful questions:\n\n${agent.instructions}`
-    );
-    console.log("Generated questions:", output);
-
-    // const generatedQuestions = (output[0] as TextMessage).content;
-
-    const rawOutput = output[0] as TextMessage;
-
-    const generatedQuestions =
-      typeof rawOutput.content === "string"
-        ? rawOutput.content
-        : rawOutput.content.map(c => c.text).join("\n"); // For TextContent[]
-
-
-    // Step 3: Save questions to agent's lastResponse
-    await step.run("save-response", async () => {
-      await db
-        .update(agents)
-        .set({
-          lastResponse: generatedQuestions,
-          updatedAt: new Date(),
-        })
-        .where(eq(agents.id, agentId));
+    await step.run("save-questions", async () => {
+      await db.insert(quizQuestions).values(
+        deduped.map(question => ({ agentId, question }))
+      );
     });
 
-    return { questions: generatedQuestions };
+    return { success: true, added: deduped.length };
   }
 );
 
+const quizGrader = createAgent({
+  name: "quiz-grader",
+  system: `
+You grade pre-interview screening quiz answers. You are given the role's INSTRUCTIONS and a JSON array of {index, question, answer} pairs. For each pair, rate how well the answer demonstrates relevant experience/skill for the role on a 0-10 scale, and give one short (1-2 sentence) piece of feedback.
 
+Output ONLY a JSON array of {"index": number, "rating": number, "feedback": string}, one entry per input pair, nothing else — no markdown fence, no commentary.
+  `.trim(),
+  model: gemini({
+    model: "gemini-1.5-flash",
+    apiKey: env.GEMINI_API_KEY,
+  }),
+});
+
+// Grades a completed quiz attempt and embeds each Q&A pair into Qdrant,
+// scoped to this candidate (candidateId payload field), so the live
+// interview's retrieval tool (src/app/api/webhook/route.ts) can pull up
+// what the candidate actually said instead of guessing.
+export const gradeQuizAttempt = inngest.createFunction(
+  { id: "grade-quiz-attempt" },
+  { event: "quiz/attempt-completed" },
+  async ({ event, step }) => {
+    const { quizAttemptId } = parseEvent("quiz/attempt-completed", event.data);
+
+    const attempt = await step.run("fetch-attempt", async () => {
+      return db.select().from(quizAttempts).where(eq(quizAttempts.id, quizAttemptId)).then(res => res[0]);
+    });
+    if (!attempt) throw new Error("Quiz attempt not found");
+
+    const answeredQuestions = await step.run("fetch-answered-questions", async () => {
+      return db
+        .select()
+        .from(quizAttemptQuestions)
+        .where(eq(quizAttemptQuestions.quizAttemptId, quizAttemptId))
+        .then(rows => rows.filter(r => r.answerText && r.answerText.trim().length > 0));
+    });
+
+    const agent = await step.run("fetch-agent", async () => {
+      return db.select().from(agents).where(eq(agents.id, attempt.agentId)).then(res => res[0]);
+    });
+    if (!agent) throw new Error("Agent not found");
+
+    if (answeredQuestions.length === 0) {
+      await step.run("mark-completed-no-answers", async () => {
+        await db.update(quizAttempts).set({ overallScore: 0 }).where(eq(quizAttempts.id, quizAttemptId));
+      });
+      return { success: true, graded: 0 };
+    }
+
+    type Grade = { index: number; rating: number; feedback: string };
+    const grades = await step.run("grade-answers", async () => {
+      const pairs = answeredQuestions.map((q, index) => ({ index, question: q.questionText, answer: q.answerText }));
+      try {
+        const { output } = await quizGrader.run(
+          `INSTRUCTIONS:\n${agent.instructions}\n\nPAIRS:\n${JSON.stringify(pairs)}`
+        );
+        const raw = textMessageContent(output[0] as TextMessage);
+        const parsed = parseJsonArray(raw);
+        if (!parsed) throw new Error("Grader did not return a JSON array");
+        return parsed
+          .filter((g): g is Grade =>
+            typeof g === "object" && g !== null &&
+            typeof (g as Grade).index === "number" &&
+            typeof (g as Grade).rating === "number"
+          )
+          .map(g => ({ ...g, rating: Math.max(0, Math.min(10, Math.round(g.rating))) }));
+      } catch (err) {
+        console.error(`[quiz-grading-failed] attempt=${quizAttemptId}`, err);
+        return pairs.map((p): Grade => ({ index: p.index, rating: 0, feedback: "Grading unavailable." }));
+      }
+    });
+
+    await step.run("save-grades", async () => {
+      await Promise.all(
+        grades.map(g => {
+          const question = answeredQuestions[g.index];
+          if (!question) return Promise.resolve();
+          return db
+            .update(quizAttemptQuestions)
+            .set({ rating: g.rating, feedback: g.feedback })
+            .where(eq(quizAttemptQuestions.id, question.id));
+        })
+      );
+      const overallScore = Math.round(
+        (grades.reduce((sum, g) => sum + g.rating, 0) / grades.length) * 10
+      );
+      await db.update(quizAttempts).set({ overallScore }).where(eq(quizAttempts.id, quizAttemptId));
+    });
+
+    await step.run("embed-candidate-answers", async () => {
+      await ensureAgentCollection();
+      const points = await mapWithConcurrency(answeredQuestions, EMBED_CONCURRENCY, async (q) => {
+        const text = `Q: ${q.questionText}\nA: ${q.answerText}`;
+        const vector = await geminiEmbeddings.embedQuery(text);
+        return {
+          id: randomUUID(),
+          vector,
+          payload: {
+            agentId: attempt.agentId,
+            candidateId: attempt.userId,
+            source: "quiz",
+            text,
+            chunkIndex: 0,
+          } satisfies AgentVectorPayload,
+        };
+      });
+      await qdrant.upsert("agents", { points, wait: true });
+    });
+
+    return { success: true, graded: grades.length };
+  }
+);
 
 function chunkText(
   text: string,

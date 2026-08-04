@@ -10,8 +10,13 @@ const meetingsProcessing = z.object({
   transcriptUrl: z.string(),
 });
 
-const agentsQuestions = z.object({
+const agentsGenerateQuizQuestions = z.object({
   agentId: z.string(),
+  count: z.number().int().positive(),
+});
+
+const quizAttemptCompleted = z.object({
+  quizAttemptId: z.string(),
 });
 
 const agentsGenerateEmbeddings = z.object({
@@ -42,7 +47,8 @@ const documentsProcess = z.object({
 
 export const EventSchemas = {
   "meetings/processing": meetingsProcessing,
-  "agents/questions": agentsQuestions,
+  "agents/generate-quiz-questions": agentsGenerateQuizQuestions,
+  "quiz/attempt-completed": quizAttemptCompleted,
   "agents/generate-embeddings": agentsGenerateEmbeddings,
   "agents/crawl-urls": agentsCrawlUrls,
   "agent/message": agentMessage,

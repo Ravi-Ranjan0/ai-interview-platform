@@ -5,6 +5,7 @@ import { conversationsRouter } from '@/modules/conversations/server/procedures';
 import { messagesRouter } from '@/modules/chat/server/procedures';
 import { documentsRouter } from '@/modules/documents/server/procedures';
 import { roomsRouter } from '@/modules/rooms/server/procedures';
+import { quizRouter } from '@/modules/quiz/server/procedures';
 
 export const appRouter = createTRPCRouter({
   agents: agentsRouter,
@@ -13,6 +14,7 @@ export const appRouter = createTRPCRouter({
   messages: messagesRouter,
   documents: documentsRouter,
   rooms: roomsRouter,
+  quiz: quizRouter,
 });
 // export type definition of API
 export type AppRouter = typeof appRouter;

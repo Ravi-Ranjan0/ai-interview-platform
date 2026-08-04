@@ -6,50 +6,67 @@ import { CallEndedEvent, CallRecordingReadyEvent, CallSessionParticipantLeftEven
 import { and, eq, not } from "drizzle-orm";
 import { NextRequest, NextResponse } from "next/server";
 import { qdrant } from "@/lib/qdrant";
+import { geminiEmbeddings } from "@/lib/embedding";
 import type { AgentVectorPayload } from "@/inngest/functions";
 import { env } from "@/lib/env";
 
-// ponytail: static per-session RAG context — pull top-K agent-scoped chunks
-// with no query filter and inline them into the instructions. Upgrade path:
-// register a Stream/OpenAI tool for mid-conversation retrieval.
-const RAG_CONTEXT_LIMIT = 20;
-const RAG_CONTEXT_CHAR_CAP = 6000;
+const RAG_SCORE_THRESHOLD = 0.5;
 
-async function buildAgentSessionContext(agentId: string): Promise<string> {
-    try {
-        const result = await qdrant.scroll("agents", {
-            filter: { must: [{ key: "agentId", match: { value: agentId } }] },
-            limit: RAG_CONTEXT_LIMIT,
-            with_payload: true,
-            with_vector: false,
-        });
-        const points = result.points ?? [];
-        if (points.length === 0) return "";
-        let total = 0;
-        const parts: string[] = [];
-        for (const p of points) {
-            const payload = p.payload as Partial<AgentVectorPayload> | null;
-            const text = payload?.text?.trim();
-            if (!text) continue;
-            const source = payload?.fileName ?? payload?.url ?? "knowledge base";
-            const block = `[${source}${payload?.section ? ` · ${payload.section}` : ""}]\n${text}`;
-            if (total + block.length > RAG_CONTEXT_CHAR_CAP) break;
-            parts.push(block);
-            total += block.length;
-        }
-        return parts.join("\n\n---\n\n");
-    } catch (err) {
-        // Interview proceeds with instructions only, but log with a
-        // greppable prefix so ops can find silent RAG regressions.
-        // Was N2 in cycle 4.
-        console.error(`[interview-rag-fallback] agent=${agentId}`, err);
-        return "";
-    }
+// Mid-conversation retrieval: registered as an OpenAI Realtime tool (see
+// call.session_started below) instead of a one-shot context dump, so the
+// live interviewer can pull in specific facts on demand. `addTool` (from
+// @openai/realtime-api-beta, which @stream-io/openai-realtime-api wraps)
+// owns the whole function-call round trip itself — it re-registers the tool
+// into the session, sends `function_call_output` once `handler` resolves,
+// and triggers the next response. No manual event wiring needed.
+//
+// `candidateId` scopes quiz-answer-derived chunks (see gradeQuizAttempt in
+// src/inngest/functions.ts) to the one candidate they belong to; general
+// knowledge-base chunks have no candidateId and stay visible to everyone.
+function buildKnowledgeBaseSearchTool(agentId: string, candidateId: string) {
+    return {
+        definition: {
+            name: "search_knowledge_base",
+            description:
+                "Search the candidate's uploaded documents, crawled sources, and their pre-interview quiz answers for facts relevant to a topic. Call this whenever you need specifics about the candidate's background/experience or the job knowledge base instead of guessing.",
+            parameters: {
+                type: "object",
+                properties: {
+                    query: { type: "string", description: "What to search for" },
+                },
+                required: ["query"],
+            },
+        },
+        handler: async ({ query }: { query: string }) => {
+            try {
+                const vector = await geminiEmbeddings.embedQuery(query);
+                const raw = await qdrant.search("agents", {
+                    vector,
+                    limit: 8,
+                    filter: {
+                        must: [{ key: "agentId", match: { value: agentId } }],
+                        should: [
+                            { is_empty: { key: "candidateId" } },
+                            { key: "candidateId", match: { value: candidateId } },
+                        ],
+                    },
+                });
+                const hits = raw.filter((r) => (r.score ?? 0) >= RAG_SCORE_THRESHOLD).slice(0, 5);
+                if (hits.length === 0) return { found: false, results: [] };
+                return {
+                    found: true,
+                    results: hits.map((r) => {
+                        const p = r.payload as Partial<AgentVectorPayload>;
+                        return { text: p.text, source: p.source ?? p.fileName ?? p.url ?? "quiz answer" };
+                    }),
+                };
+            } catch (err) {
+                console.error(`[interview-rag-tool-failed] agent=${agentId}`, err);
+                return { found: false, results: [], error: "retrieval failed" };
+            }
+        },
+    };
 }
-
-
-
-
 function verifySignaturewithSDK(body: string, signature: string): boolean {
     return streamVideo.verifyWebhook(body, signature);
 };
@@ -123,16 +140,13 @@ export async function POST(req: NextRequest) {
             agentUserId: existingAgent.id,
         });
 
-        const ragContext = await buildAgentSessionContext(existingAgent.id);
-        const sessionInstructions = ragContext
-            ? `${existingAgent.instructions}\n\nREFERENCE MATERIAL (from the candidate's uploaded documents and crawled sources — cite briefly when you use it):\n${ragContext}`
-            : existingAgent.instructions;
+        const tool = buildKnowledgeBaseSearchTool(existingAgent.id, existingMeeting.userId);
+        realTimeClient.addTool(tool.definition, tool.handler);
 
         await realTimeClient.updateSession({
-            instructions: sessionInstructions,
+            instructions:
+                `${existingAgent.instructions}\n\nYou have a search_knowledge_base tool. Call it whenever you need concrete details about the candidate or the role instead of guessing.`,
         });
-
-
 
     } else if (eventType === "call.session_participant_left") {
         const event = payload as CallSessionParticipantLeftEvent;

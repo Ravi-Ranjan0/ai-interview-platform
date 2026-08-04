@@ -2,7 +2,7 @@ import { useState, useMemo } from "react";
 import { CallControls, SpeakerLayout } from "@stream-io/video-react-sdk";
 import { Link } from "lucide-react";
 import { useTRPC } from "@/trpc/clients";
-import { useSuspenseQuery } from "@tanstack/react-query";
+import { useSuspenseQuery, useQuery } from "@tanstack/react-query";
 
 interface Props {
   onLeave: () => void;
@@ -16,17 +16,23 @@ export const CallActive = ({ onLeave, meetingId, meetingName }: Props) => {
     trpc.meetings.getOne.queryOptions({ id: meetingId })
   );
 
-  const questions = useMemo(() => {
-    const text = data.agent.lastResponse || "";
-    const lines = text
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line.startsWith("*") || line.startsWith("•") || line.startsWith("-"));
+  // Reference card sourced from the candidate's own latest completed
+  // pre-interview quiz for this agent — replaces the old generic bullet-list
+  // cue card (agent.lastResponse), which was never candidate-specific.
+  const { data: attempts } = useQuery(trpc.quiz.listAttempts.queryOptions({ agentId: data.agentId }));
+  const latestCompletedAttemptId = useMemo(
+    () => attempts?.find((a) => a.status === "completed")?.id ?? null,
+    [attempts]
+  );
+  const { data: latestAttempt } = useQuery({
+    ...trpc.quiz.getAttempt.queryOptions({ attemptId: latestCompletedAttemptId ?? "" }),
+    enabled: !!latestCompletedAttemptId,
+  });
 
-    return lines.map((line) =>
-      line.replace(/^([*•\-])\s*/, "").replace(/^\"|\"$/g, "")
-    );
-  }, [data.agent.lastResponse]);
+  const questions = useMemo(
+    () => (latestAttempt?.questions ?? []).filter((q) => !!q.answerText),
+    [latestAttempt]
+  );
 
   const [currentIndex, setCurrentIndex] = useState(0);
   const currentQuestion = questions[currentIndex];
@@ -62,13 +68,17 @@ export const CallActive = ({ onLeave, meetingId, meetingName }: Props) => {
       <div className="flex-1 mt-6 flex flex-col items-center gap-6">
         <SpeakerLayout />
 
-        {questions.length > 0 && (
+        {questions.length > 0 && currentQuestion && (
           <div className="w-full max-w-3xl bg-gray-800 p-6 rounded-2xl shadow-lg text-white">
-            <h3 className="text-xl font-semibold mb-3">
-              Question {currentIndex + 1} of {questions.length}
+            <h3 className="text-xl font-semibold mb-1">
+              Your quiz answer {currentIndex + 1} of {questions.length}
             </h3>
-            <p className="text-lg leading-relaxed text-gray-200">
-              {currentQuestion}
+            <p className="text-sm text-gray-400 mb-3">Reference from your pre-interview quiz</p>
+            <p className="text-base font-medium text-gray-100">
+              {currentQuestion.questionText}
+            </p>
+            <p className="text-lg leading-relaxed text-gray-300 mt-2">
+              {currentQuestion.answerText}
             </p>
             <div className="flex justify-between items-center mt-6">
               <button
