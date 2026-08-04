@@ -2,10 +2,11 @@ import { StreamTranscriptItem } from "@/modules/meetings/type";
 import { inngest } from "./client";
 import { parseEvent } from "./events";
 import { env } from "@/lib/env";
+import { ROOM_STALE_AFTER_MS } from "@/constant";
 import JSONL from "jsonl-parse-stringify";
 import { db } from "@/db";
-import { agents, meetings, messages, user, documents } from "@/db/schema";
-import { eq, inArray } from "drizzle-orm";
+import { agents, meetings, messages, user, documents, rooms, roomMessages } from "@/db/schema";
+import { and, eq, gte, inArray, lt, notExists } from "drizzle-orm";
 import { createAgent, gemini, TextMessage, } from "@inngest/agent-kit";
 import { qdrant, ensureAgentCollection } from "@/lib/qdrant";
 import { geminiEmbeddings, VECTOR_SIZE } from "@/lib/embedding";
@@ -792,5 +793,40 @@ export const crawlAgentUrls = inngest.createFunction(
     });
 
     return { success: true, pagesCrawled: allPages.length, failedUrls: failedUrls.length };
+  }
+);
+
+// First cron-triggered function in the app. Cancels 'open' discussion rooms
+// that are old and have had no chat activity in ROOM_STALE_AFTER_MS, keeping
+// the lobby from filling up with abandoned rooms nobody ever scheduled.
+export const cancelStaleRooms = inngest.createFunction(
+  { id: "rooms-cancel-stale" },
+  { cron: "0 * * * *" }, // hourly
+  async ({ step }) => {
+    const staleBefore = new Date(Date.now() - ROOM_STALE_AFTER_MS);
+
+    const cancelledRooms = await step.run("cancel-stale-open-rooms", async () => {
+      return db
+        .update(rooms)
+        .set({ status: "cancelled", updatedAt: new Date() })
+        .where(
+          and(
+            eq(rooms.status, "open"),
+            lt(rooms.createdAt, staleBefore),
+            notExists(
+              db
+                .select({ id: roomMessages.id })
+                .from(roomMessages)
+                .where(
+                  and(eq(roomMessages.roomId, rooms.id), gte(roomMessages.createdAt, staleBefore))
+                )
+            )
+          )
+        )
+        .returning({ id: rooms.id });
+    });
+
+    console.log(`[rooms-cancel-stale] cancelled ${cancelledRooms.length} stale room(s)`);
+    return { cancelledCount: cancelledRooms.length };
   }
 );

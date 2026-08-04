@@ -9,11 +9,14 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useTRPC } from "@/trpc/clients";
 import { useMutation, useQueryClient, useSuspenseQuery } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
+import { useState } from "react";
 import { toast } from "sonner";
 import { format } from "date-fns";
-import { CalendarClockIcon, LogOutIcon, PartyPopperIcon, XCircleIcon } from "lucide-react";
+import { CalendarClockIcon, LogOutIcon, PartyPopperIcon, SettingsIcon, VideoIcon, XCircleIcon } from "lucide-react";
 import { RoomChat } from "../components/room-chat";
 import { SchedulePanel } from "../components/schedule-panel";
+import { ManageMembersDialog } from "../components/manage-members-dialog";
 import { ROOM_STATUS_BADGE_VARIANT, RoomStatus } from "../../type";
 import { authClient } from "@/lib/auth-client";
 
@@ -26,6 +29,7 @@ export const RoomIdView = ({ roomId }: Props) => {
   const router = useRouter();
   const queryClient = useQueryClient();
   const { data: session } = authClient.useSession();
+  const [isManageMembersOpen, setIsManageMembersOpen] = useState(false);
 
   const { data: room } = useSuspenseQuery(trpc.rooms.getOne.queryOptions({ id: roomId }));
 
@@ -93,6 +97,14 @@ export const RoomIdView = ({ roomId }: Props) => {
             </Badge>
           </div>
           <div className="flex items-center gap-x-2">
+            {room.status === RoomStatus.Scheduled && (
+              <Button size="sm" variant="default" asChild>
+                <Link href={`/room-call/${roomId}`}>
+                  <VideoIcon className="size-4 mr-1" />
+                  Join Call
+                </Link>
+              </Button>
+            )}
             {!isClosed && (
               <Button
                 size="sm"
@@ -150,6 +162,26 @@ export const RoomIdView = ({ roomId }: Props) => {
           <span className="text-xs text-muted-foreground">
             {room.memberCount} {room.memberCount === 1 ? "member" : "members"}
           </span>
+          {isCreator && (
+            <>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-6 px-2 text-xs"
+                onClick={() => setIsManageMembersOpen(true)}
+              >
+                <SettingsIcon className="size-3 mr-1" />
+                Manage
+              </Button>
+              <ManageMembersDialog
+                roomId={roomId}
+                creatorId={room.createdBy}
+                members={room.members}
+                open={isManageMembersOpen}
+                onOpenChange={setIsManageMembersOpen}
+              />
+            </>
+          )}
         </div>
       </div>
 

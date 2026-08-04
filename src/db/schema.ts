@@ -180,6 +180,7 @@ export const roomMessages = pgTable("room_messages", {
   roomId: text('room_id').notNull().references(() => rooms.id, { onDelete: 'cascade' }),
   userId: text('user_id').notNull().references(() => user.id, { onDelete: 'cascade' }),
   content: text('content').notNull(),
+  editedAt: timestamp('edited_at'),
   createdAt: timestamp('created_at').notNull().defaultNow(),
 }, (table) => [
   index("room_messages_room_id_idx").on(table.roomId),

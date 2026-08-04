@@ -1,6 +1,6 @@
 import { serve } from "inngest/next";
 import { inngest } from "@/inngest/client";
-import {  generateAgentQuestions, meetingsProcessing, generateAndStoreEmbeddings, agentChatHandler, processDocumentEmbeddings, crawlAgentUrls } from "@/inngest/functions";
+import {  generateAgentQuestions, meetingsProcessing, generateAndStoreEmbeddings, agentChatHandler, processDocumentEmbeddings, crawlAgentUrls, cancelStaleRooms } from "@/inngest/functions";
 
 export const { GET, POST, PUT } = serve({
   client: inngest,
@@ -11,5 +11,6 @@ export const { GET, POST, PUT } = serve({
     agentChatHandler,
     processDocumentEmbeddings,
     crawlAgentUrls,
+    cancelStaleRooms,
   ],
 });

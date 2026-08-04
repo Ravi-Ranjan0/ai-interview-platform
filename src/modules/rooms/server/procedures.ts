@@ -1,4 +1,15 @@
-import { DEFAULT_PAGE, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, ROOM_BONUS_POINTS } from "@/constant";
+import {
+  DEFAULT_PAGE,
+  DEFAULT_PAGE_SIZE,
+  MAX_PAGE_SIZE,
+  ROOM_BONUS_POINTS,
+  ROOM_CREATE_RATE_LIMIT,
+  ROOM_CREATE_RATE_WINDOW_MS,
+  ROOM_MESSAGE_PAGE_SIZE,
+  ROOM_MESSAGE_RATE_LIMIT,
+  ROOM_MESSAGE_RATE_WINDOW_MS,
+  ROOM_SLOTS_PAGE_SIZE,
+} from "@/constant";
 import { db } from "@/db";
 import {
   rooms,
@@ -12,10 +23,29 @@ import {
 } from "@/db/schema";
 import { createTRPCRouter, protectedProcedure } from "@/trpc/init";
 import { TRPCError } from "@trpc/server";
-import { and, asc, count, desc, eq, getTableColumns, ilike, inArray, ne, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, getTableColumns, gte, ilike, inArray, ne, sql } from "drizzle-orm";
 import z from "zod";
 import { roomsInsertSchema, sendRoomMessageSchema, proposeSlotSchema } from "../schema";
 import { assertRoomMember } from "@/lib/authz";
+import { streamVideo } from "@/lib/stream-video";
+import { generateAvatarUri } from "@/lib/avatar";
+
+// Shared by `leave` and `removeMember`: drops a member's row plus anything
+// that would otherwise linger and keep influencing quorum/votes after they're
+// no longer part of the room.
+async function removeMemberFromRoom(roomId: string, userId: string) {
+  await db
+    .delete(roomMembers)
+    .where(and(eq(roomMembers.roomId, roomId), eq(roomMembers.userId, userId)));
+
+  await db
+    .delete(roomCompletions)
+    .where(and(eq(roomCompletions.roomId, roomId), eq(roomCompletions.userId, userId)));
+
+  await db
+    .delete(roomTimeSlotVotes)
+    .where(and(eq(roomTimeSlotVotes.roomId, roomId), eq(roomTimeSlotVotes.userId, userId)));
+}
 
 export const roomsRouter = createTRPCRouter({
   getMany: protectedProcedure
@@ -24,17 +54,22 @@ export const roomsRouter = createTRPCRouter({
         page: z.number().default(DEFAULT_PAGE),
         pageSize: z.number().min(1).max(MAX_PAGE_SIZE).default(DEFAULT_PAGE_SIZE),
         search: z.string().nullish(),
+        status: z.enum(["open", "scheduled", "completed", "cancelled"]).nullish(),
       })
     )
     .query(async ({ ctx, input }) => {
-      const { page, pageSize, search } = input;
+      const { page, pageSize, search, status } = input;
+
+      // Default view hides cancelled rooms; explicitly filtering by a status
+      // (including "cancelled") shows exactly that status instead.
+      const statusFilter = status ? eq(rooms.status, status) : ne(rooms.status, "cancelled");
 
       const data = await db
         .select(getTableColumns(rooms))
         .from(rooms)
         .where(
           and(
-            ne(rooms.status, "cancelled"),
+            statusFilter,
             search ? ilike(rooms.topic, `%${search}%`) : undefined,
           )
         )
@@ -47,7 +82,7 @@ export const roomsRouter = createTRPCRouter({
         .from(rooms)
         .where(
           and(
-            ne(rooms.status, "cancelled"),
+            statusFilter,
             search ? ilike(rooms.topic, `%${search}%`) : undefined,
           )
         );
@@ -129,6 +164,23 @@ export const roomsRouter = createTRPCRouter({
     }),
 
   create: protectedProcedure.input(roomsInsertSchema).mutation(async ({ ctx, input }) => {
+    const [{ recentCount }] = await db
+      .select({ recentCount: count() })
+      .from(rooms)
+      .where(
+        and(
+          eq(rooms.createdBy, ctx.auth.user.id),
+          gte(rooms.createdAt, new Date(Date.now() - ROOM_CREATE_RATE_WINDOW_MS))
+        )
+      );
+
+    if (recentCount >= ROOM_CREATE_RATE_LIMIT) {
+      throw new TRPCError({
+        code: "TOO_MANY_REQUESTS",
+        message: "You've created too many rooms recently. Please try again later.",
+      });
+    }
+
     const [createdRoom] = await db
       .insert(rooms)
       .values({ topic: input.topic, createdBy: ctx.auth.user.id })
@@ -180,11 +232,36 @@ export const roomsRouter = createTRPCRouter({
         });
       }
 
-      await db
-        .delete(roomMembers)
-        .where(
-          and(eq(roomMembers.roomId, input.roomId), eq(roomMembers.userId, ctx.auth.user.id))
-        );
+      await removeMemberFromRoom(input.roomId, ctx.auth.user.id);
+
+      return { success: true };
+    }),
+
+  removeMember: protectedProcedure
+    .input(z.object({ roomId: z.string(), userId: z.string() }))
+    .mutation(async ({ ctx, input }) => {
+      const [room] = await db
+        .select({ createdBy: rooms.createdBy })
+        .from(rooms)
+        .where(eq(rooms.id, input.roomId));
+
+      if (!room) {
+        throw new TRPCError({ code: "NOT_FOUND", message: "Room not found" });
+      }
+      if (room.createdBy !== ctx.auth.user.id) {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message: "Only the room creator can remove a member.",
+        });
+      }
+      if (input.userId === ctx.auth.user.id) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: "The room creator cannot remove themself.",
+        });
+      }
+
+      await removeMemberFromRoom(input.roomId, input.userId);
 
       return { success: true };
     }),
@@ -242,13 +319,15 @@ export const roomsRouter = createTRPCRouter({
           senderImage: user.image,
           content: roomMessages.content,
           createdAt: roomMessages.createdAt,
+          editedAt: roomMessages.editedAt,
         })
         .from(roomMessages)
         .innerJoin(user, eq(roomMessages.userId, user.id))
         .where(eq(roomMessages.roomId, input.roomId))
-        .orderBy(asc(roomMessages.createdAt));
+        .orderBy(desc(roomMessages.createdAt))
+        .limit(ROOM_MESSAGE_PAGE_SIZE);
 
-      return rows;
+      return rows.reverse();
     }),
 
   sendMessage: protectedProcedure
@@ -256,11 +335,65 @@ export const roomsRouter = createTRPCRouter({
     .mutation(async ({ ctx, input }) => {
       await assertRoomMember(input.roomId, ctx.auth.user.id);
 
+      const [{ recentCount }] = await db
+        .select({ recentCount: count() })
+        .from(roomMessages)
+        .where(
+          and(
+            eq(roomMessages.userId, ctx.auth.user.id),
+            gte(roomMessages.createdAt, new Date(Date.now() - ROOM_MESSAGE_RATE_WINDOW_MS))
+          )
+        );
+
+      if (recentCount >= ROOM_MESSAGE_RATE_LIMIT) {
+        throw new TRPCError({
+          code: "TOO_MANY_REQUESTS",
+          message: "You're sending messages too fast. Please slow down.",
+        });
+      }
+
       await db.insert(roomMessages).values({
         roomId: input.roomId,
         userId: ctx.auth.user.id,
         content: input.content,
       });
+
+      return { success: true };
+    }),
+
+  editMessage: protectedProcedure
+    .input(z.object({ messageId: z.string(), content: z.string().min(1) }))
+    .mutation(async ({ ctx, input }) => {
+      const [updated] = await db
+        .update(roomMessages)
+        .set({ content: input.content, editedAt: new Date() })
+        .where(and(eq(roomMessages.id, input.messageId), eq(roomMessages.userId, ctx.auth.user.id)))
+        .returning();
+
+      if (!updated) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Message not found, or you don't own it.",
+        });
+      }
+
+      return updated;
+    }),
+
+  deleteMessage: protectedProcedure
+    .input(z.object({ messageId: z.string() }))
+    .mutation(async ({ ctx, input }) => {
+      const [deleted] = await db
+        .delete(roomMessages)
+        .where(and(eq(roomMessages.id, input.messageId), eq(roomMessages.userId, ctx.auth.user.id)))
+        .returning({ id: roomMessages.id });
+
+      if (!deleted) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Message not found, or you don't own it.",
+        });
+      }
 
       return { success: true };
     }),
@@ -278,7 +411,8 @@ export const roomsRouter = createTRPCRouter({
         .from(roomTimeSlots)
         .innerJoin(user, eq(roomTimeSlots.proposedBy, user.id))
         .where(eq(roomTimeSlots.roomId, input.roomId))
-        .orderBy(asc(roomTimeSlots.createdAt));
+        .orderBy(desc(roomTimeSlots.createdAt))
+        .limit(ROOM_SLOTS_PAGE_SIZE);
 
       const voteCounts = await db
         .select({ slotId: roomTimeSlotVotes.slotId, voteCount: count() })
@@ -386,6 +520,39 @@ export const roomsRouter = createTRPCRouter({
         });
       }
 
+      // Best-effort: set up the group video call for the scheduled time.
+      // A failure here shouldn't undo the (already-committed) schedule finalize.
+      try {
+        const members = await db
+          .select({ userId: roomMembers.userId, name: user.name, image: user.image })
+          .from(roomMembers)
+          .innerJoin(user, eq(roomMembers.userId, user.id))
+          .where(eq(roomMembers.roomId, slot.roomId));
+
+        await streamVideo.upsertUsers(
+          members.map((m) => ({
+            id: m.userId,
+            name: m.name || "User",
+            role: "user",
+            image: m.image ?? generateAvatarUri({ seed: m.name, variant: "initials" }),
+          }))
+        );
+
+        const call = streamVideo.video.call("default", updatedRoom.id);
+        await call.create({
+          data: {
+            created_by_id: ctx.auth.user.id,
+            custom: {
+              roomId: updatedRoom.id,
+              roomTopic: updatedRoom.topic,
+            },
+            starts_at: updatedRoom.scheduledAt ?? undefined,
+          },
+        });
+      } catch (err) {
+        console.error("Failed to create Stream call for room", updatedRoom.id, err);
+      }
+
       return updatedRoom;
     }),
 
@@ -455,4 +622,23 @@ export const roomsRouter = createTRPCRouter({
 
     return row?.total ?? 0;
   }),
+
+  getBonusLeaderboard: protectedProcedure
+    .input(z.object({ limit: z.number().min(1).max(50).default(10) }))
+    .query(async ({ input }) => {
+      const rows = await db
+        .select({
+          userId: roomBonusAwards.userId,
+          name: user.name,
+          image: user.image,
+          total: sql<number>`SUM(${roomBonusAwards.points})`.mapWith(Number).as("total"),
+        })
+        .from(roomBonusAwards)
+        .innerJoin(user, eq(roomBonusAwards.userId, user.id))
+        .groupBy(roomBonusAwards.userId, user.name, user.image)
+        .orderBy(desc(sql`SUM(${roomBonusAwards.points})`))
+        .limit(input.limit);
+
+      return rows;
+    }),
 });

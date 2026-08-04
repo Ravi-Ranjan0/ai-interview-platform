@@ -4,7 +4,15 @@ import { KeyboardEvent, useEffect, useRef, useState } from "react";
 import { useTRPC } from "@/trpc/clients";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
-import { Loader2Icon, SendHorizonalIcon, MessagesSquareIcon } from "lucide-react";
+import {
+  CheckIcon,
+  Loader2Icon,
+  PencilIcon,
+  SendHorizonalIcon,
+  MessagesSquareIcon,
+  Trash2Icon,
+  XIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 import { GeneratedAvatar } from "@/components/generated-avatar";
 import { cn } from "@/lib/utils";
@@ -24,6 +32,9 @@ export const RoomChat = ({ roomId, disabled }: Props) => {
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editContent, setEditContent] = useState("");
+
   const { data: messages, refetch } = useQuery({
     ...trpc.rooms.listMessages.queryOptions({ roomId }),
     refetchInterval: POLL_INTERVAL_MS,
@@ -35,6 +46,34 @@ export const RoomChat = ({ roomId, disabled }: Props) => {
       onError: (e) => toast.error(e.message),
     })
   );
+
+  const editMessage = useMutation(
+    trpc.rooms.editMessage.mutationOptions({
+      onSuccess: () => {
+        setEditingId(null);
+        refetch();
+      },
+      onError: (e) => toast.error(e.message),
+    })
+  );
+
+  const deleteMessage = useMutation(
+    trpc.rooms.deleteMessage.mutationOptions({
+      onSuccess: () => refetch(),
+      onError: (e) => toast.error(e.message),
+    })
+  );
+
+  const startEdit = (messageId: string, content: string) => {
+    setEditingId(messageId);
+    setEditContent(content);
+  };
+
+  const saveEdit = () => {
+    const content = editContent.trim();
+    if (!editingId || !content) return;
+    editMessage.mutate({ messageId: editingId, content });
+  };
 
   const handleSend = async () => {
     const content = input.trim();
@@ -86,11 +125,12 @@ export const RoomChat = ({ roomId, disabled }: Props) => {
 
         {rows.map((m) => {
           const isSelf = m.userId === session?.user.id;
+          const isEditing = editingId === m.id;
           return (
             <div
               key={m.id}
               className={cn(
-                "flex gap-x-2 animate-in fade-in slide-in-from-bottom-1 duration-200",
+                "group flex gap-x-2 animate-in fade-in slide-in-from-bottom-1 duration-200",
                 isSelf ? "justify-end" : "justify-start"
               )}
             >
@@ -105,16 +145,81 @@ export const RoomChat = ({ roomId, disabled }: Props) => {
                 {!isSelf && (
                   <span className="text-xs text-muted-foreground px-1">{m.senderName}</span>
                 )}
-                <div
-                  className={cn(
-                    "px-3.5 py-2 rounded-2xl text-sm whitespace-pre-wrap",
-                    isSelf
-                      ? "bg-primary text-primary-foreground rounded-br-sm"
-                      : "bg-muted text-foreground rounded-bl-sm"
-                  )}
-                >
-                  {m.content}
-                </div>
+                {isEditing ? (
+                  <div className="flex items-center gap-x-1.5 w-full">
+                    <textarea
+                      autoFocus
+                      rows={1}
+                      value={editContent}
+                      onChange={(e) => setEditContent(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && !e.shiftKey) {
+                          e.preventDefault();
+                          saveEdit();
+                        }
+                        if (e.key === "Escape") setEditingId(null);
+                      }}
+                      className="min-w-[180px] resize-none rounded-2xl border bg-background px-3.5 py-2 text-sm outline-none"
+                    />
+                    <Button
+                      size="icon"
+                      className="size-7 shrink-0 rounded-full"
+                      disabled={editMessage.isPending || !editContent.trim()}
+                      onClick={saveEdit}
+                    >
+                      <CheckIcon className="size-3.5" />
+                    </Button>
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      className="size-7 shrink-0 rounded-full"
+                      onClick={() => setEditingId(null)}
+                    >
+                      <XIcon className="size-3.5" />
+                    </Button>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-x-1">
+                    {isSelf && !disabled && (
+                      <div className="hidden group-hover:flex items-center gap-x-0.5 order-first">
+                        <button
+                          type="button"
+                          onClick={() => startEdit(m.id, m.content)}
+                          className="p-1 rounded text-muted-foreground hover:text-foreground"
+                        >
+                          <PencilIcon className="size-3" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => deleteMessage.mutate({ messageId: m.id })}
+                          className="p-1 rounded text-muted-foreground hover:text-destructive"
+                        >
+                          <Trash2Icon className="size-3" />
+                        </button>
+                      </div>
+                    )}
+                    <div
+                      className={cn(
+                        "px-3.5 py-2 rounded-2xl text-sm whitespace-pre-wrap",
+                        isSelf
+                          ? "bg-primary text-primary-foreground rounded-br-sm"
+                          : "bg-muted text-foreground rounded-bl-sm"
+                      )}
+                    >
+                      {m.content}
+                      {m.editedAt && (
+                        <span
+                          className={cn(
+                            "ml-1.5 text-[10px]",
+                            isSelf ? "text-primary-foreground/70" : "text-muted-foreground"
+                          )}
+                        >
+                          (edited)
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           );
