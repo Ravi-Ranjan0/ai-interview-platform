@@ -28,7 +28,7 @@ function buildKnowledgeBaseSearchTool(agentId: string, candidateId: string) {
         definition: {
             name: "search_knowledge_base",
             description:
-                "Search the candidate's uploaded documents, crawled sources, and their pre-interview quiz answers for facts relevant to a topic. Call this whenever you need specifics about the candidate's background/experience or the job knowledge base instead of guessing.",
+                "Search the candidate's uploaded documents, crawled sources, pre-interview quiz answers, and summaries of their past interview sessions for facts relevant to a topic. Call this whenever you need specifics about the candidate's background/experience, prior performance, or the job knowledge base instead of guessing.",
             parameters: {
                 type: "object",
                 properties: {

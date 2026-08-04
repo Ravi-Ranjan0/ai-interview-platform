@@ -26,10 +26,14 @@ export type AgentVectorPayload = {
   fileName?: string;
   documentId?: string;
   source?: string;
-  // Set only on quiz-answer-derived points (see gradeQuizAttempt below) so
-  // the live interview's retrieval tool can scope a search to one candidate
-  // while general knowledge-base chunks (no candidateId) stay visible to all.
+  // Set only on quiz-answer-derived and interview-summary-derived points
+  // (see gradeQuizAttempt and meetingsProcessing below) so the live
+  // interview's retrieval tool can scope a search to one candidate while
+  // general knowledge-base chunks (no candidateId) stay visible to all.
   candidateId?: string;
+  // Set only on interview-summary-derived points; traces a chunk back to
+  // the specific past meeting it summarizes.
+  meetingId?: string;
 };
 
 // ponytail: 5-at-a-time cap avoids Gemini 429s on large docs. Upgrade path:
@@ -88,6 +92,12 @@ export const meetingsProcessing = inngest.createFunction(
   { event: "meetings/processing" },
   async ({ event, step }) => {
     const { meetingId, transcriptUrl } = parseEvent("meetings/processing", event.data);
+
+    const meeting = await step.run("fetch-meeting", async () => {
+      return db.select().from(meetings).where(eq(meetings.id, meetingId)).then(res => res[0]);
+    });
+    if (!meeting) throw new Error("Meeting not found");
+
     const response = await step.run("fetch-transcript", async () => {
       return fetch(transcriptUrl).then((res) => res.text());
     });
@@ -149,14 +159,42 @@ export const meetingsProcessing = inngest.createFunction(
       JSON.stringify(transcriptWithSpeakers)
     )
 
+    const summaryText = (output[0] as TextMessage).content as string;
+
     await step.run("save-summary", async () => {
       await db
         .update(meetings)
         .set({
-          summary: (output[0] as TextMessage).content as string,
+          summary: summaryText,
           status: "completed",
         })
         .where(eq(meetings.id, meetingId));
+    });
+
+    // Embed the interview summary the same way quiz answers are embedded
+    // (candidateId-scoped, same "agents" Qdrant collection) so both chat and
+    // future live interviews can retrieve what happened in this candidate's
+    // past sessions, not just their quiz answers and uploaded docs.
+    await step.run("embed-interview-summary", async () => {
+      await ensureAgentCollection();
+      const chunks = chunkText(summaryText);
+      const points = await mapWithConcurrency(chunks, EMBED_CONCURRENCY, async (chunk) => {
+        const vector = await geminiEmbeddings.embedQuery(chunk.chunk);
+        return {
+          id: randomUUID(),
+          vector,
+          payload: {
+            agentId: meeting.agentId,
+            candidateId: meeting.userId,
+            source: "interview",
+            meetingId: meeting.id,
+            section: chunk.heading,
+            text: chunk.chunk,
+            chunkIndex: chunk.index,
+          } satisfies AgentVectorPayload,
+        };
+      });
+      await qdrant.upsert("agents", { points, wait: true });
     });
 
   });
@@ -380,59 +418,144 @@ export const gradeQuizAttempt = inngest.createFunction(
   }
 );
 
+// Markdown ATX heading, any level (1-6 per CommonMark). Checked per-line
+// (not per-paragraph-blob) so a heading immediately followed by body text on
+// the next line — no blank line in between, e.g. "#### Section\n- bullet" —
+// is still detected. The previous version's non-multiline regex only ever
+// matched when a heading was the *entire* isolated paragraph, which missed
+// exactly this shape (notably the interview-summarizer's own output).
+function matchHeadingLine(line: string): string | null {
+  const match = line.trim().match(/^#{1,6}\s+(.+)$/);
+  return match ? match[1].trim() : null;
+}
+
+function splitIntoSections(text: string): { heading: string; body: string }[] {
+  const sections: { heading: string; lines: string[] }[] = [{ heading: "Content", lines: [] }];
+  for (const line of text.split("\n")) {
+    const heading = matchHeadingLine(line);
+    if (heading) {
+      sections.push({ heading, lines: [] });
+    } else {
+      sections[sections.length - 1].lines.push(line);
+    }
+  }
+  return sections
+    .map(s => ({ heading: s.heading, body: s.lines.join("\n").trim() }))
+    .filter(s => s.body.length > 0);
+}
+
+// Splits section body into sentence/line-sized units, never wider than
+// maxChars. Prefers sentence boundaries; a single unbroken run longer than
+// maxChars (rare — e.g. a URL-heavy line) falls back to slicing on the
+// nearest word boundary so a word is never cut in half.
+function splitIntoUnits(body: string, maxChars: number): string[] {
+  const units: string[] = [];
+  for (const paragraph of body.split(/\n{2,}/).map(p => p.trim()).filter(Boolean)) {
+    const pieces = paragraph
+      .split(/(?<=[.!?])\s+(?=[A-Z0-9"'(])|\n+/)
+      .map(s => s.trim())
+      .filter(Boolean);
+
+    for (const piece of pieces) {
+      if (piece.length <= maxChars) {
+        units.push(piece);
+        continue;
+      }
+      let rest = piece;
+      while (rest.length > maxChars) {
+        let cut = rest.lastIndexOf(" ", maxChars);
+        if (cut <= 0) cut = maxChars;
+        units.push(rest.slice(0, cut).trim());
+        rest = rest.slice(cut).trim();
+      }
+      if (rest) units.push(rest);
+    }
+  }
+  return units;
+}
+
+// Greedily packs units into ~maxChars chunks. Every boundary carries the
+// trailing ~overlap chars of units forward into the next chunk — unlike the
+// previous version, where overlap only applied to the one oversized-blob
+// branch and every ordinary paragraph-boundary chunk got none.
+function packUnits(units: string[], maxChars: number, overlap: number): string[] {
+  const chunks: string[] = [];
+  let current: string[] = [];
+  let currentLength = 0;
+
+  const takeOverlapTail = (nextUnit: string): string[] => {
+    const carry: string[] = [];
+    let carryLength = 0;
+    for (let i = current.length - 1; i >= 0 && carryLength < overlap; i--) {
+      const unit = current[i];
+      // Only fold genuinely small trailing units into the overlap window.
+      // A unit that's already large on its own (e.g. a maxChars-sized slice
+      // from the word-boundary fallback below) would blow the next chunk's
+      // budget the moment a new unit is added on top of it — so for that
+      // boundary, start the next chunk fresh instead of forcing overlap.
+      if (unit.length > overlap) break;
+      carry.unshift(unit);
+      carryLength += unit.length + 1;
+    }
+    // Carrying is only useful if there's still room left for the unit that
+    // triggered this flush — otherwise we'd just have to unwind it again
+    // immediately, producing a redundant near-duplicate chunk. Skip it.
+    if (carryLength + nextUnit.length + 1 > maxChars) return [];
+    return carry;
+  };
+
+  for (const unit of units) {
+    if (current.length > 0 && currentLength + unit.length + 1 > maxChars) {
+      chunks.push(current.join(" "));
+      current = takeOverlapTail(unit);
+      currentLength = current.reduce((sum, u) => sum + u.length + 1, 0);
+    }
+
+    current.push(unit);
+    currentLength += unit.length + 1;
+
+    // Defensive: a carried-forward unit plus this new unit can still
+    // combine to exceed maxChars in one step (belt-and-suspenders on top of
+    // the guard above). Catch it immediately rather than letting it compound
+    // with whatever unit comes next.
+    if (currentLength > maxChars && current.length > 1) {
+      const justAdded = current.pop()!;
+      chunks.push(current.join(" "));
+      current = [justAdded];
+      currentLength = justAdded.length + 1;
+    }
+  }
+  if (current.length > 0) chunks.push(current.join(" "));
+
+  return chunks;
+}
+
 function chunkText(
   text: string,
-  options: { maxChars?: number; overlap?: number } = {}
-) {
+  options: { maxChars?: number; overlap?: number; minChars?: number } = {}
+): { heading: string; chunk: string; index: number }[] {
   const MAX_CHARS = options.maxChars ?? 1000;
   const OVERLAP = options.overlap ?? 200;
+  const MIN_CHARS = options.minChars ?? 150;
+
   const results: { heading: string; chunk: string; index: number }[] = [];
 
-  const paragraphs = text.split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
+  for (const section of splitIntoSections(text)) {
+    const units = splitIntoUnits(section.body, MAX_CHARS);
+    const chunks = packUnits(units, MAX_CHARS, OVERLAP);
 
-  let currentHeading = "Content";
-  let buffer: string[] = [];
-  let bufferLength = 0;
-
-  function flushBuffer(heading: string) {
-    if (buffer.length === 0) return;
-    const fullText = buffer.join("\n\n");
-
-    if (fullText.length <= MAX_CHARS) {
-      results.push({ heading, chunk: fullText, index: results.length });
-    } else {
-      let start = 0;
-      while (start < fullText.length) {
-        const end = Math.min(start + MAX_CHARS, fullText.length);
-        results.push({
-          heading,
-          chunk: fullText.slice(start, end),
-          index: results.length,
-        });
-        start += MAX_CHARS - OVERLAP;
-      }
+    // A tiny trailing chunk is a low-signal embedding on its own — fold it
+    // into its predecessor instead (unless it's the section's only chunk).
+    if (chunks.length > 1 && chunks[chunks.length - 1].length < MIN_CHARS) {
+      const last = chunks.pop()!;
+      chunks[chunks.length - 1] = `${chunks[chunks.length - 1]} ${last}`;
     }
-    buffer = [];
-    bufferLength = 0;
+
+    for (const chunk of chunks) {
+      results.push({ heading: section.heading, chunk, index: results.length });
+    }
   }
 
-  for (const para of paragraphs) {
-    const headingMatch = para.match(/^#{1,3}\s+(.+)$/);
-    if (headingMatch) {
-      flushBuffer(currentHeading);
-      currentHeading = headingMatch[1].trim();
-      continue;
-    }
-
-    if (bufferLength + para.length > MAX_CHARS && buffer.length > 0) {
-      flushBuffer(currentHeading);
-    }
-
-    buffer.push(para);
-    bufferLength += para.length;
-  }
-
-  flushBuffer(currentHeading);
   return results;
 }
 
@@ -638,13 +761,18 @@ export const agentChatHandler = inngest.createFunction(
             fileName: payload.fileName,
             url: payload.url,
             section: payload.section,
+            // "quiz" / "interview" for candidate-derived chunks (see
+            // gradeQuizAttempt / meetingsProcessing); a document's fileName
+            // for uploads. Lets the chat UI label sources meaningfully
+            // instead of falling back to a generic "knowledge base".
+            source: payload.source,
             score: r.score,
           };
         });
 
         const contextParts = searchResults.map((result, i) => {
           const payload = result.payload as Partial<AgentVectorPayload>;
-          const source = payload.url || payload.fileName || "knowledge base";
+          const source = payload.url || payload.fileName || payload.source || "knowledge base";
           return `[Source ${i + 1}: ${source}${payload.section ? ` - ${payload.section}` : ""}]\n${payload.text ?? ""}`;
         });
 

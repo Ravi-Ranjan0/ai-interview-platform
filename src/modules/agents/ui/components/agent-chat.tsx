@@ -21,6 +21,7 @@ type Source = {
   fileName?: string;
   url?: string;
   section?: string;
+  source?: string;
   score?: number;
 };
 
@@ -54,6 +55,8 @@ function sourceLabel(s: Source): string {
       return s.url;
     }
   }
+  if (s.source === "quiz") return "your quiz answers";
+  if (s.source === "interview") return "a past interview summary";
   return "knowledge base";
 }
 
