@@ -8,9 +8,9 @@ import { db } from "@/db";
 import { agents, meetings, messages, user, documents, rooms, roomMessages, quizQuestions, quizAttempts, quizAttemptQuestions } from "@/db/schema";
 import { and, eq, gte, inArray, lt, notExists } from "drizzle-orm";
 import { createAgent, gemini, TextMessage, } from "@inngest/agent-kit";
-import { qdrant, ensureAgentCollection } from "@/lib/qdrant";
-import { geminiEmbeddings, VECTOR_SIZE } from "@/lib/embedding";
-import { randomUUID } from "crypto";
+import { ensureAgentCollection } from "@/lib/qdrant";
+import { indexChunksForSource, removeSource, listIndexedSourceIds } from "@/lib/knowledge-index";
+import { hybridSearch } from "@/lib/hybrid-search";
 import stringSimilarity from "string-similarity";
 
 // Shared shape between the two writers (URL + document pipelines) and the
@@ -35,27 +35,6 @@ export type AgentVectorPayload = {
   // the specific past meeting it summarizes.
   meetingId?: string;
 };
-
-// ponytail: 5-at-a-time cap avoids Gemini 429s on large docs. Upgrade path:
-// swap for p-limit if we ever need per-key concurrency across events.
-const EMBED_CONCURRENCY = 5;
-async function mapWithConcurrency<T, R>(
-  items: T[],
-  limit: number,
-  fn: (item: T, index: number) => Promise<R>
-): Promise<R[]> {
-  const results: R[] = new Array(items.length);
-  let cursor = 0;
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (true) {
-      const i = cursor++;
-      if (i >= items.length) return;
-      results[i] = await fn(items[i], i);
-    }
-  });
-  await Promise.all(workers);
-  return results;
-}
 
 
 const summarizer = createAgent({
@@ -175,26 +154,17 @@ export const meetingsProcessing = inngest.createFunction(
     // (candidateId-scoped, same "agents" Qdrant collection) so both chat and
     // future live interviews can retrieve what happened in this candidate's
     // past sessions, not just their quiz answers and uploaded docs.
-    await step.run("embed-interview-summary", async () => {
-      await ensureAgentCollection();
+    await step.run("index-interview-summary", async () => {
       const chunks = chunkText(summaryText);
-      const points = await mapWithConcurrency(chunks, EMBED_CONCURRENCY, async (chunk) => {
-        const vector = await geminiEmbeddings.embedQuery(chunk.chunk);
-        return {
-          id: randomUUID(),
-          vector,
-          payload: {
-            agentId: meeting.agentId,
-            candidateId: meeting.userId,
-            source: "interview",
-            meetingId: meeting.id,
-            section: chunk.heading,
-            text: chunk.chunk,
-            chunkIndex: chunk.index,
-          } satisfies AgentVectorPayload,
-        };
+      await indexChunksForSource({
+        agentId: meeting.agentId,
+        sourceType: "interview",
+        sourceId: meeting.id,
+        candidateId: meeting.userId,
+        label: "interview",
+        payloadExtra: { meetingId: meeting.id },
+        chunks: chunks.map(c => ({ heading: c.heading, text: c.chunk, chunkIndex: c.index })),
       });
-      await qdrant.upsert("agents", { points, wait: true });
     });
 
   });
@@ -394,24 +364,18 @@ export const gradeQuizAttempt = inngest.createFunction(
       await db.update(quizAttempts).set({ overallScore }).where(eq(quizAttempts.id, quizAttemptId));
     });
 
-    await step.run("embed-candidate-answers", async () => {
-      await ensureAgentCollection();
-      const points = await mapWithConcurrency(answeredQuestions, EMBED_CONCURRENCY, async (q) => {
-        const text = `Q: ${q.questionText}\nA: ${q.answerText}`;
-        const vector = await geminiEmbeddings.embedQuery(text);
-        return {
-          id: randomUUID(),
-          vector,
-          payload: {
-            agentId: attempt.agentId,
-            candidateId: attempt.userId,
-            source: "quiz",
-            text,
-            chunkIndex: 0,
-          } satisfies AgentVectorPayload,
-        };
+    await step.run("index-candidate-answers", async () => {
+      await indexChunksForSource({
+        agentId: attempt.agentId,
+        sourceType: "quiz",
+        sourceId: attempt.id,
+        candidateId: attempt.userId,
+        label: "quiz",
+        chunks: answeredQuestions.map((q, i) => ({
+          text: `Q: ${q.questionText}\nA: ${q.answerText}`,
+          chunkIndex: i,
+        })),
       });
-      await qdrant.upsert("agents", { points, wait: true });
     });
 
     return { success: true, graded: grades.length };
@@ -429,9 +393,30 @@ function matchHeadingLine(line: string): string | null {
   return match ? match[1].trim() : null;
 }
 
+// ``` or ~~~ fence marker (optionally followed by a language tag on the
+// opening line). Tracked as on/off toggle — good enough for well-formed
+// fenced blocks without needing to match fence character/length exactly.
+function isFenceLine(line: string): boolean {
+  return /^(`{3,}|~{3,})/.test(line.trim());
+}
+
 function splitIntoSections(text: string): { heading: string; body: string }[] {
   const sections: { heading: string; lines: string[] }[] = [{ heading: "Content", lines: [] }];
+  let inFence = false;
   for (const line of text.split("\n")) {
+    if (isFenceLine(line)) {
+      inFence = !inFence;
+      sections[sections.length - 1].lines.push(line);
+      continue;
+    }
+    // A `#`-prefixed line inside a fenced code block (e.g. a Python/shell
+    // comment) is not a markdown heading — skip heading detection entirely
+    // while inside a fence, otherwise it would incorrectly split a code
+    // block across "sections".
+    if (inFence) {
+      sections[sections.length - 1].lines.push(line);
+      continue;
+    }
     const heading = matchHeadingLine(line);
     if (heading) {
       sections.push({ heading, lines: [] });
@@ -444,13 +429,87 @@ function splitIntoSections(text: string): { heading: string; body: string }[] {
     .filter(s => s.body.length > 0);
 }
 
-// Splits section body into sentence/line-sized units, never wider than
-// maxChars. Prefers sentence boundaries; a single unbroken run longer than
-// maxChars (rare — e.g. a URL-heavy line) falls back to slicing on the
-// nearest word boundary so a word is never cut in half.
-function splitIntoUnits(body: string, maxChars: number): string[] {
+type ContentSegment = { type: "code" | "prose"; content: string };
+
+// Splits a section's body into alternating code/prose runs so each gets the
+// chunking strategy suited to it — a fenced code block needs to stay intact
+// (or split between statements/functions), while narrative prose is fine
+// split at sentence boundaries.
+function splitIntoSegments(body: string): ContentSegment[] {
+  const lines = body.split("\n");
+  const segments: ContentSegment[] = [];
+  let prose: string[] = [];
+  let i = 0;
+
+  const flushProse = () => {
+    if (prose.length > 0) {
+      segments.push({ type: "prose", content: prose.join("\n") });
+      prose = [];
+    }
+  };
+
+  while (i < lines.length) {
+    if (isFenceLine(lines[i])) {
+      const code: string[] = [lines[i]];
+      i++;
+      while (i < lines.length && !isFenceLine(lines[i])) {
+        code.push(lines[i]);
+        i++;
+      }
+      if (i < lines.length) {
+        code.push(lines[i]); // closing fence
+        i++;
+      }
+      flushProse();
+      segments.push({ type: "code", content: code.join("\n") });
+      continue;
+    }
+    prose.push(lines[i]);
+    i++;
+  }
+  flushProse();
+  return segments;
+}
+
+// Splits an oversized code block on blank lines — the closest cheap proxy
+// for "between functions/top-level statements" without a real parser per
+// language. Only when a single statement group has no internal blank line
+// (one very long function) does it fall back to slicing on whole *lines*,
+// which — unlike the prose path's word-boundary slice — never cuts a line
+// (and so never a token/identifier) in half.
+function splitCodeIntoUnits(code: string, maxChars: number): string[] {
+  if (code.length <= maxChars) return [code];
+
   const units: string[] = [];
-  for (const paragraph of body.split(/\n{2,}/).map(p => p.trim()).filter(Boolean)) {
+  for (const group of code.split(/\n{2,}/).filter(Boolean)) {
+    if (group.length <= maxChars) {
+      units.push(group);
+      continue;
+    }
+    const lines = group.split("\n");
+    let buffer: string[] = [];
+    let bufferLength = 0;
+    for (const line of lines) {
+      if (bufferLength + line.length + 1 > maxChars && buffer.length > 0) {
+        units.push(buffer.join("\n"));
+        buffer = [];
+        bufferLength = 0;
+      }
+      buffer.push(line);
+      bufferLength += line.length + 1;
+    }
+    if (buffer.length > 0) units.push(buffer.join("\n"));
+  }
+  return units;
+}
+
+// Splits prose into sentence/line-sized units, never wider than maxChars.
+// Prefers sentence boundaries; a single unbroken run longer than maxChars
+// (rare — e.g. a URL-heavy line) falls back to slicing on the nearest word
+// boundary so a word is never cut in half.
+function splitProseIntoUnits(prose: string, maxChars: number): string[] {
+  const units: string[] = [];
+  for (const paragraph of prose.split(/\n{2,}/).map(p => p.trim()).filter(Boolean)) {
     const pieces = paragraph
       .split(/(?<=[.!?])\s+(?=[A-Z0-9"'(])|\n+/)
       .map(s => s.trim())
@@ -469,6 +528,18 @@ function splitIntoUnits(body: string, maxChars: number): string[] {
         rest = rest.slice(cut).trim();
       }
       if (rest) units.push(rest);
+    }
+  }
+  return units;
+}
+
+function splitIntoUnits(body: string, maxChars: number): string[] {
+  const units: string[] = [];
+  for (const segment of splitIntoSegments(body)) {
+    if (segment.type === "code") {
+      units.push(...splitCodeIntoUnits(segment.content, maxChars));
+    } else {
+      units.push(...splitProseIntoUnits(segment.content, maxChars));
     }
   }
   return units;
@@ -617,53 +688,47 @@ export const generateAndStoreEmbeddings = inngest.createFunction(
 
     console.log(`Total chunks extracted: ${chunks.length}`);
 
-    // 3) Deduplicate chunks
+    // 3) Deduplicate chunks (near-identical boilerplate across pages, e.g.
+    // shared nav/footer text — a different problem from indexChunksForSource's
+    // exact-hash diffing below, which compares a single page's chunks against
+    // what was already indexed for that same page in a previous run).
     const uniqueChunks = deduplicateChunks(chunks);
     console.log(`Unique chunks after deduplication: ${uniqueChunks.length}`);
 
-    // 4️⃣ Generate embeddings
-    const vectors = await step.run("generate-embeddings", async () => {
-      return mapWithConcurrency(uniqueChunks, EMBED_CONCURRENCY, async (chunk) => {
-        const vector = await geminiEmbeddings.embedQuery(chunk.chunkText);
+    // 4) Index per page — each page is its own source, so re-crawling later
+    // only re-embeds pages whose content actually changed.
+    const result = await step.run("index-chunks", async () => {
+      const byUrl = new Map<string, typeof uniqueChunks>();
+      for (const chunk of uniqueChunks) {
+        const group = byUrl.get(chunk.url) ?? [];
+        group.push(chunk);
+        byUrl.set(chunk.url, group);
+      }
 
-        if (vector.length !== VECTOR_SIZE) {
-          throw new Error(
-            `Vector dimension mismatch! Expected ${VECTOR_SIZE}, got ${vector.length}`
-          );
-        }
+      let indexed = 0, cached = 0, skippedUnchanged = 0, removed = 0;
+      for (const [url, group] of byUrl) {
+        const stats = await indexChunksForSource({
+          agentId,
+          sourceType: "url",
+          sourceId: url,
+          label: url,
+          payloadExtra: { url },
+          chunks: group.map(c => ({ heading: c.section, text: c.chunkText, chunkIndex: c.chunkIndex })),
+        });
+        indexed += stats.indexed;
+        cached += stats.cached;
+        skippedUnchanged += stats.skippedUnchanged;
+        removed += stats.removed;
+      }
 
-        return {
-          id: randomUUID(),
-          vector,
-          payload: {
-            agentId,
-            url: chunk.url,
-            section: chunk.section,
-            text: chunk.chunkText,
-            chunkIndex: chunk.chunkIndex,
-          },
-        };
-      });
+      console.log(
+        `[index-chunks] agent=${agentId} indexed=${indexed} cached=${cached} ` +
+          `skippedUnchanged=${skippedUnchanged} removed=${removed}`
+      );
+      return { indexed, cached, skippedUnchanged, removed };
     });
 
-    console.log(`📊 Generated ${vectors.length} embeddings`);
-
-    // 5️⃣ Store embeddings in Qdrant
-    const result = await step.run("store-embeddings", async () => {
-      const points = vectors.map(v => ({
-        id: v.id,
-        vector: v.vector,
-        payload: v.payload
-      }));
-
-      console.log(`📦 Upserting ${points.length} points to Qdrant`);
-      const upsertResult = await qdrant.upsert("agents", { points, wait: true });
-      console.log(`✅ Successfully stored embeddings for agent ${agentId}`, upsertResult);
-
-      return { success: true, pointsStored: points.length };
-    });
-
-    return { success: true, pointsStored: result.pointsStored, agentId };
+    return { success: true, pointsStored: result.indexed, agentId };
   }
 );
 
@@ -709,71 +774,55 @@ export const agentChatHandler = inngest.createFunction(
 
     const instructionsText = agent.instructions ?? "";
 
-    // 2) RAG retrieval: embed user question and search Qdrant
+    // 2) RAG retrieval: hybrid dense+lexical search (see src/lib/hybrid-search.ts)
     const retrieval = await step.run("rag-retrieval", async () => {
       try {
-        const queryVector = await geminiEmbeddings.embedQuery(content);
+        const hits = await hybridSearch({ agentId, candidateId: userId, query: content, limit: 10 });
 
-        // Fetch a wider window than we'll actually use, so [rag-scores] logs
-        // show what got filtered out — needed to tune SCORE_THRESHOLD (C3).
-        // Keep the effective behavior identical: filter in TS at 0.5.
-        const rawResults = await qdrant.search("agents", {
-          vector: queryVector,
-          limit: 10,
-          filter: {
-            must: [
-              { key: "agentId", match: { value: agentId } },
-            ],
-          },
-        });
-
-        const SCORE_THRESHOLD = 0.5;
+        const DENSE_SCORE_THRESHOLD = 0.5;
         // Below the main threshold there's still a "probably relevant, just
         // not a confident match" band. A hard cutoff at 0.5 was answering
         // "I don't know" even when the single best hit was a near-miss (e.g.
         // 0.46) instead of actually irrelevant — fall back to the top match
         // alone if it clears this lower floor, rather than dropping context
-        // entirely.
-        const FALLBACK_FLOOR = 0.35;
-        let searchResults = rawResults
-          .filter((r) => (r.score ?? 0) >= SCORE_THRESHOLD)
+        // entirely. An exact lexical match qualifies on its own regardless of
+        // cosine score — that's the whole point of the lexical leg.
+        const DENSE_FALLBACK_FLOOR = 0.35;
+        let searchResults = hits
+          .filter((h) => h.matchedLexical || (h.denseScore ?? 0) >= DENSE_SCORE_THRESHOLD)
           .slice(0, 5);
         let usedFallback = false;
 
-        if (searchResults.length === 0 && (rawResults[0]?.score ?? 0) >= FALLBACK_FLOOR) {
-          searchResults = rawResults.slice(0, 1);
+        if (searchResults.length === 0 && (hits[0]?.denseScore ?? 0) >= DENSE_FALLBACK_FLOOR) {
+          searchResults = hits.slice(0, 1);
           usedFallback = true;
         }
 
         // One structured line per chat request. Grep `[rag-scores]` in prod
         // logs to build a score-distribution histogram before tuning.
         console.log(
-          `[rag-scores] agent=${agentId} threshold=${SCORE_THRESHOLD} ` +
-            `raw=${JSON.stringify(rawResults.map((r) => Number((r.score ?? 0).toFixed(3))))} ` +
+          `[rag-scores] agent=${agentId} threshold=${DENSE_SCORE_THRESHOLD} ` +
+            `dense=${JSON.stringify(hits.map((h) => Number((h.denseScore ?? 0).toFixed(3))))} ` +
+            `lexical=${JSON.stringify(hits.map((h) => h.matchedLexical))} ` +
             `kept=${searchResults.length} fallback=${usedFallback}`
         );
 
         if (searchResults.length === 0) return { context: "", sources: [], error: null };
 
-        const sources = searchResults.map((r) => {
-          const payload = r.payload as Partial<AgentVectorPayload>;
-          return {
-            fileName: payload.fileName,
-            url: payload.url,
-            section: payload.section,
-            // "quiz" / "interview" for candidate-derived chunks (see
-            // gradeQuizAttempt / meetingsProcessing); a document's fileName
-            // for uploads. Lets the chat UI label sources meaningfully
-            // instead of falling back to a generic "knowledge base".
-            source: payload.source,
-            score: r.score,
-          };
-        });
+        const sources = searchResults.map((h) => ({
+          // "quiz" / "interview" for candidate-derived chunks (see
+          // gradeQuizAttempt / meetingsProcessing); a document's fileName
+          // for uploads. Lets the chat UI label sources meaningfully
+          // instead of falling back to a generic "knowledge base".
+          source: h.label,
+          section: h.heading,
+          score: h.denseScore,
+          matchedLexical: h.matchedLexical,
+        }));
 
-        const contextParts = searchResults.map((result, i) => {
-          const payload = result.payload as Partial<AgentVectorPayload>;
-          const source = payload.url || payload.fileName || payload.source || "knowledge base";
-          return `[Source ${i + 1}: ${source}${payload.section ? ` - ${payload.section}` : ""}]\n${payload.text ?? ""}`;
+        const contextParts = searchResults.map((h, i) => {
+          const source = h.label || "knowledge base";
+          return `[Source ${i + 1}: ${source}${h.heading ? ` - ${h.heading}` : ""}]\n${h.text}`;
         });
 
         return { context: contextParts.join("\n\n---\n\n"), sources, error: null };
@@ -896,42 +945,17 @@ export const processDocumentEmbeddings = inngest.createFunction(
     // this catch, the document was left stuck at status "processing"
     // forever once Inngest's retries were exhausted, with no error surfaced.
     try {
-      // 5) Generate embeddings
-      const vectors = await step.run("generate-embeddings", async () => {
-        return mapWithConcurrency(chunks, EMBED_CONCURRENCY, async (chunk) => {
-          const vector = await geminiEmbeddings.embedQuery(chunk.chunk);
-
-          if (vector.length !== VECTOR_SIZE) {
-            throw new Error(
-              `Vector dimension mismatch! Expected ${VECTOR_SIZE}, got ${vector.length}`
-            );
-          }
-
-          return {
-            id: randomUUID(),
-            vector,
-            payload: {
-              agentId,
-              documentId,
-              fileName,
-              source: fileName,
-              section: chunk.heading,
-              text: chunk.chunk,
-              chunkIndex: chunk.index,
-            },
-          };
-        });
-      });
-
-      // 6) Store in Qdrant
-      await step.run("store-embeddings", async () => {
-        await qdrant.upsert("agents", {
-          points: vectors.map(v => ({
-            id: v.id,
-            vector: v.vector,
-            payload: v.payload,
-          })),
-          wait: true,
+      // 5-6) Index chunks — diffs against whatever was already indexed for
+      // this documentId, so reprocessing the same document only re-embeds
+      // chunks that actually changed.
+      const stats = await step.run("index-chunks", async () => {
+        return indexChunksForSource({
+          agentId,
+          sourceType: "document",
+          sourceId: documentId,
+          label: fileName,
+          payloadExtra: { documentId, fileName },
+          chunks: chunks.map(c => ({ heading: c.heading, text: c.chunk, chunkIndex: c.index })),
         });
       });
 
@@ -941,14 +965,17 @@ export const processDocumentEmbeddings = inngest.createFunction(
           .update(documents)
           .set({
             status: "completed",
-            chunkCount: vectors.length,
+            chunkCount: stats.indexed + stats.skippedUnchanged,
             updatedAt: new Date(),
           })
           .where(eq(documents.id, documentId));
       });
 
-      console.log(`Successfully processed ${fileName}: ${vectors.length} chunks stored`);
-      return { success: true, chunksProcessed: vectors.length };
+      console.log(
+        `Successfully processed ${fileName}: indexed=${stats.indexed} cached=${stats.cached} ` +
+          `skippedUnchanged=${stats.skippedUnchanged} removed=${stats.removed}`
+      );
+      return { success: true, chunksProcessed: stats.indexed };
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error during embedding";
       console.error(`[document-process-failed] document=${documentId} agent=${agentId}: ${message}`);
@@ -965,8 +992,9 @@ export const processDocumentEmbeddings = inngest.createFunction(
 
 
 // Crawl an agent's URL list off the request path (was A10: sync-in-mutation).
-// Idempotent — clears prior URL-sourced vectors for this agent, then re-embeds
-// via the existing generateAndStoreEmbeddings function.
+// Incremental — prunes URLs no longer present, then re-embeds via
+// generateAndStoreEmbeddings, which itself only re-indexes chunks that
+// actually changed within each surviving page (see indexChunksForSource).
 export const crawlAgentUrls = inngest.createFunction(
   { id: "agents-crawl-urls" },
   { event: "agents/crawl-urls" },
@@ -983,25 +1011,6 @@ export const crawlAgentUrls = inngest.createFunction(
         .update(agents)
         .set({ urlsStatus: "processing", urlsError: null, updatedAt: new Date() })
         .where(eq(agents.id, agentId));
-    });
-
-    // Delete prior URL-sourced vectors for this agent.
-    // Discriminator: URL points have `url`, no `documentId`. Document points
-    // have `documentId`. So `must agentId=X + must_not documentId exists`.
-    await step.run("clear-url-vectors", async () => {
-      try {
-        const filter = {
-          must: [{ key: "agentId", match: { value: agentId } }],
-          must_not: [{ is_empty: { key: "documentId" } }],
-        };
-        // Qdrant delete supports a filter form; the SDK's overload types are
-        // ambiguous here so we cast the whole options bag.
-        await qdrant.delete("agents", { filter, wait: true } as never);
-      } catch (err) {
-        // ponytail: best-effort cleanup — if Qdrant rejects the filter we
-        // still proceed to re-crawl, and the worst case is duplicate points.
-        console.error(`Qdrant URL-vector cleanup failed for agent ${agentId}:`, err);
-      }
     });
 
     // Crawl. Playwright navigation stays sequential (one browser instance),
@@ -1040,6 +1049,23 @@ export const crawlAgentUrls = inngest.createFunction(
       });
       return { success: false, reason: "No content extracted" };
     }
+
+    // Prune URLs that dropped out of the crawl entirely (e.g. removed from
+    // the agent's URL list, or now 404ing). Content that changed *within* a
+    // surviving URL is diffed separately, per-page, inside
+    // generateAndStoreEmbeddings via indexChunksForSource — this step only
+    // handles URLs no longer present at all.
+    await step.run("prune-removed-urls", async () => {
+      const currentUrls = new Set(allPages.map(p => p.url));
+      const previouslyIndexedUrls = await listIndexedSourceIds(agentId, "url");
+      const removedUrls = previouslyIndexedUrls.filter(u => !currentUrls.has(u));
+      for (const url of removedUrls) {
+        await removeSource("url", url);
+      }
+      if (removedUrls.length > 0) {
+        console.log(`[prune-removed-urls] agent=${agentId} removed=${removedUrls.length}`);
+      }
+    });
 
     // Reuse the existing embed pipeline verbatim.
     await step.sendEvent("dispatch-embeddings", {

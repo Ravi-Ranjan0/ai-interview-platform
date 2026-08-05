@@ -5,12 +5,11 @@ import { streamVideo } from "@/lib/stream-video";
 import { CallEndedEvent, CallRecordingReadyEvent, CallSessionParticipantLeftEvent, CallSessionStartedEvent, CallTranscriptionReadyEvent } from "@stream-io/node-sdk";
 import { and, eq, not } from "drizzle-orm";
 import { NextRequest, NextResponse } from "next/server";
-import { qdrant } from "@/lib/qdrant";
-import { geminiEmbeddings } from "@/lib/embedding";
-import type { AgentVectorPayload } from "@/inngest/functions";
+import { hybridSearch } from "@/lib/hybrid-search";
 import { env } from "@/lib/env";
 
 const RAG_SCORE_THRESHOLD = 0.5;
+const RAG_FALLBACK_FLOOR = 0.35;
 
 // Mid-conversation retrieval: registered as an OpenAI Realtime tool (see
 // call.session_started below) instead of a one-shot context dump, so the
@@ -39,26 +38,22 @@ function buildKnowledgeBaseSearchTool(agentId: string, candidateId: string) {
         },
         handler: async ({ query }: { query: string }) => {
             try {
-                const vector = await geminiEmbeddings.embedQuery(query);
-                const raw = await qdrant.search("agents", {
-                    vector,
-                    limit: 8,
-                    filter: {
-                        must: [{ key: "agentId", match: { value: agentId } }],
-                        should: [
-                            { is_empty: { key: "candidateId" } },
-                            { key: "candidateId", match: { value: candidateId } },
-                        ],
-                    },
-                });
-                const hits = raw.filter((r) => (r.score ?? 0) >= RAG_SCORE_THRESHOLD).slice(0, 5);
+                const results = await hybridSearch({ agentId, candidateId, query, limit: 8 });
+                // An exact lexical match qualifies on its own regardless of
+                // cosine score — that's the point of the lexical leg. Falls
+                // back to the single best dense hit if nothing clears the
+                // main threshold but the top match is still a near-miss,
+                // same rationale as the chat handler's retrieval step.
+                let hits = results
+                    .filter((h) => h.matchedLexical || (h.denseScore ?? 0) >= RAG_SCORE_THRESHOLD)
+                    .slice(0, 5);
+                if (hits.length === 0 && (results[0]?.denseScore ?? 0) >= RAG_FALLBACK_FLOOR) {
+                    hits = results.slice(0, 1);
+                }
                 if (hits.length === 0) return { found: false, results: [] };
                 return {
                     found: true,
-                    results: hits.map((r) => {
-                        const p = r.payload as Partial<AgentVectorPayload>;
-                        return { text: p.text, source: p.source ?? p.fileName ?? p.url ?? "quiz answer" };
-                    }),
+                    results: hits.map((h) => ({ text: h.text, source: h.label ?? "knowledge base" })),
                 };
             } catch (err) {
                 console.error(`[interview-rag-tool-failed] agent=${agentId}`, err);

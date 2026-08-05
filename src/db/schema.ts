@@ -1,4 +1,5 @@
-import { pgTable, text, timestamp, boolean, integer, pgEnum, AnyPgColumn, index, uniqueIndex } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, boolean, integer, pgEnum, AnyPgColumn, index, uniqueIndex, customType, primaryKey } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { nanoid } from "nanoid";
 
 export const user = pgTable("user", {
@@ -271,4 +272,57 @@ export const quizAttemptQuestions = pgTable("quiz_attempt_questions", {
 }, (table) => [
   index("quiz_attempt_questions_attempt_id_idx").on(table.quizAttemptId),
   uniqueIndex("quiz_attempt_questions_attempt_question_uq").on(table.quizAttemptId, table.quizQuestionId),
+]);
+
+// Content/retrieval pipeline: bookkeeping for every chunk ever embedded, so
+// re-indexing a source can diff against what's already there (skip unchanged,
+// clean up removed) instead of blindly re-chunking, and so retrieval has a
+// Postgres full-text mirror to fuse with Qdrant's dense search. See
+// src/lib/knowledge-index.ts and src/lib/hybrid-search.ts.
+
+export const knowledgeSourceType = pgEnum("knowledge_source_type", ["document", "url", "quiz", "interview"]);
+
+const tsvector = customType<{ data: string }>({
+  dataType() {
+    return "tsvector";
+  },
+});
+
+export const knowledgeChunks = pgTable("knowledge_chunks", {
+  id: text('id').primaryKey().$defaultFn(() => nanoid()),
+  agentId: text('agent_id').notNull().references(() => agents.id, { onDelete: 'cascade' }),
+  sourceType: knowledgeSourceType('source_type').notNull(),
+  sourceId: text('source_id').notNull(), // documentId / page URL / quizAttemptId / meetingId
+  candidateId: text('candidate_id'), // mirrors AgentVectorPayload.candidateId
+  label: text('label'), // fileName / URL / "quiz" / "interview" — for display in fused results
+  contentHash: text('content_hash').notNull(), // sha256(text) — identity for diffing + cache lookup
+  qdrantPointId: text('qdrant_point_id').notNull(), // UUID actually stored in Qdrant (point ids can't be arbitrary strings)
+  heading: text('heading'),
+  text: text('text').notNull(),
+  chunkIndex: integer('chunk_index').notNull(),
+  searchVector: tsvector('search_vector').generatedAlwaysAs(sql`to_tsvector('english', "text")`),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+}, (table) => [
+  index("knowledge_chunks_agent_id_idx").on(table.agentId),
+  index("knowledge_chunks_source_idx").on(table.sourceType, table.sourceId),
+  uniqueIndex("knowledge_chunks_source_hash_uq").on(table.sourceType, table.sourceId, table.contentHash),
+  index("knowledge_chunks_search_vector_idx").using("gin", table.searchVector),
+]);
+
+// Global (not agent-scoped) so identical content reused across agents/users
+// skips re-embedding. Vector stored as raw bytes (4 bytes/dim) rather than
+// JSON to keep the cache compact.
+const bytea = customType<{ data: Buffer }>({
+  dataType() {
+    return "bytea";
+  },
+});
+
+export const embeddingCache = pgTable("embedding_cache", {
+  contentHash: text('content_hash').notNull(),
+  model: text('model').notNull(),
+  vector: bytea('vector').notNull(),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ columns: [table.contentHash, table.model] }),
 ]);

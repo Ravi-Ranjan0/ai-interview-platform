@@ -23,6 +23,7 @@ type Source = {
   section?: string;
   source?: string;
   score?: number;
+  matchedLexical?: boolean;
 };
 
 type ReplyMeta = {
@@ -55,9 +56,23 @@ function sourceLabel(s: Source): string {
       return s.url;
     }
   }
+  if (!s.source) return "knowledge base";
   if (s.source === "quiz") return "your quiz answers";
   if (s.source === "interview") return "a past interview summary";
-  return "knowledge base";
+  // Hybrid retrieval now sends everything through `source` (fileName or the
+  // page URL) rather than separate fileName/url fields — parse it as a URL
+  // when it is one, otherwise show it as-is (e.g. a document's fileName).
+  try {
+    return new URL(s.source).hostname.replace(/^www\./, "");
+  } catch {
+    return s.source;
+  }
+}
+
+function isLinkSource(s: Source): boolean {
+  if (s.url) return true;
+  if (!s.source) return false;
+  return /^https?:\/\//i.test(s.source);
 }
 
 const MARKDOWN_COMPONENTS = {
@@ -287,7 +302,7 @@ export const AgentChat = ({ agentId, agentName }: Props) => {
                     {sourcesOpen && (
                       <div className="flex flex-wrap gap-1.5">
                         {sources.map((s, si) => {
-                          const Icon = s.url ? LinkIcon : FileIcon;
+                          const Icon = isLinkSource(s) ? LinkIcon : FileIcon;
                           return (
                             <Badge
                               key={si}

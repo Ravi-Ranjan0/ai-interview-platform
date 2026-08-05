@@ -5,7 +5,7 @@ import { z } from "zod";
 import { eq, and, desc } from "drizzle-orm";
 import { TRPCError } from "@trpc/server";
 import { inngest } from "@/inngest/client";
-import { qdrant } from "@/lib/qdrant";
+import { removeSource } from "@/lib/knowledge-index";
 import { assertAgentOwned } from "@/lib/authz";
 
 export const documentsRouter = createTRPCRouter({
@@ -90,16 +90,10 @@ export const documentsRouter = createTRPCRouter({
         throw new TRPCError({ code: "NOT_FOUND", message: "Document not found." });
       }
 
-      // ponytail: best-effort Qdrant cleanup; DB delete still proceeds on failure
-      // so a stale index doesn't wedge the UI. Upgrade path: retry queue.
-      try {
-        await qdrant.delete("agents", {
-          filter: { must: [{ key: "documentId", match: { value: input.id } }] },
-          wait: true,
-        });
-      } catch (err) {
-        console.error(`Qdrant cleanup failed for document ${input.id}:`, err);
-      }
+      // Cleans up both the Qdrant points and the knowledge_chunks bookkeeping
+      // rows together; best-effort on the Qdrant side (logged, not thrown) so
+      // a transient Qdrant failure doesn't block the document row deletion.
+      await removeSource("document", input.id);
 
       await db
         .delete(documents)
